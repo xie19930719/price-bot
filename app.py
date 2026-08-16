@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import urllib.request
+import re
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -61,7 +62,7 @@ def get_jpy_rate():
     try:
         req = urllib.request.Request(
             "https://rate.bot.com.tw/xrt/flats/003/day",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             html = response.read().decode("utf-8", errors="ignore")
@@ -81,60 +82,57 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-def fetch_uniqlo_official(item_id, region="tw"):
+def fetch_uniqlo_html(item_id, region="tw"):
     clean_id = item_id.strip()
-    url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=10"
+    # 針對台灣與日本官方網址結構進行直接訪問
+    url = f"https://www.uniqlo.com/{region}/products/E{clean_id}-000"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
+    
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as response:
             if response.status != 200:
                 return None, None
-            data = json.loads(response.read().decode("utf-8", errors="ignore"))
-        items = data.get("result", {}).get("items", [])
-        if not isinstance(items, list) or not items:
-            return None, None
-
-        item = None
-        for candidate in items:
-            ids = [candidate.get(k) for k in ("id", "productCode", "itemCode", "code", "sku")]
-            if clean_id in [str(x).strip() for x in ids if x is not None]:
-                item = candidate
-                break
-        if item is None:
-            item = items[0]
-
-        name = item.get("name") or item.get("productName")
+            html_content = response.read().decode("utf-8", errors="ignore")
+            
+        # 從頁面中的 JSON-LD 或 __NEXT_DATA__ 抓取商品名稱與價格
+        name = None
         price_val = None
-        if item.get("minPrice") is not None:
-            try:
-                price_val = float(item["minPrice"])
-            except (ValueError, TypeError):
-                pass
-        if price_val is None and isinstance(item.get("prices"), dict):
-            for key in ("promo", "sale", "base", "original"):
-                value = item["prices"].get(key)
-                if isinstance(value, dict):
-                    value = value.get("value")
-                if value is not None:
-                    try:
-                        price_val = float(value)
-                        break
-                    except (ValueError, TypeError):
-                        pass
-        return name, price_val
+        
+        # 嘗試抓取 og:title 作為商品名稱備案
+        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html_content)
+        if title_match:
+            name = title_match.group(1).split('|')[0].strip()
+
+        # 嘗試從頁面內嵌的 JSON 結構中抓取價格
+        # Uniqlo 網頁通常包含包含價格的 script 標籤
+        price_match = re.findall(r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', html_content)
+        if price_match:
+            # 取出合理範圍內的數字作為價格（避免抓到其他 ID 數字）
+            prices = [float(p) for p in price_match if 100 < float(p) < 100000]
+            if prices:
+                price_val = min(prices) # 通常最小價格即為特價或基本售價
+
+        if name or price_val is not None:
+            return name, price_val
+
     except Exception as e:
-        print(f"[SEARCH API ERROR] {region}-{clean_id}: {e}")
+        print(f"[HTML PARSE ERROR] {region}-{clean_id}: {e}")
+        
     return None, None
 
 def get_combined_info(item_id):
-    name_tw, price_tw = fetch_uniqlo_official(item_id, "tw")
-    name_jp, price_jp = fetch_uniqlo_official(item_id, "jp")
+    name_tw, price_tw = fetch_uniqlo_html(item_id, "tw")
+    name_jp, price_jp = fetch_uniqlo_html(item_id, "jp")
+    
     display_tw = name_tw if name_tw else name_jp
     display_jp = name_jp if name_jp else name_tw
+    
     brand = "UNIQLO" if any(x is not None for x in (price_tw, price_jp, display_tw, display_jp)) else None
     return brand, display_tw, price_tw, display_jp, price_jp
 
@@ -194,7 +192,7 @@ if handler:
             if user_msg == "清單":
                 items = conn.execute("SELECT item_id,brand,name_tw,name_jp,price_tw,price_jp FROM tracked_items_v2 WHERE user_id=? ORDER BY item_id", (user_id,)).fetchall()
                 if not items:
-                    reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+475355`）即可開始追蹤！"
+                    reply = "📋 目前沒有追蹤任何商品。\n輸入 `+475355` 即可開始追蹤！"
                 else:
                     rate = get_jpy_rate()
                     reply = "📋 您目前追蹤的商品清單：\n"
@@ -206,7 +204,7 @@ if handler:
                         if item["price_tw"] is not None: prices.append(f"NT$ {int(item['price_tw']):,}")
                         if item["price_jp"] is not None: prices.append(f"¥ {int(item['price_jp']):,} (約 NT$ {round(item['price_jp']*rate):,})")
                         if prices: reply += f"  💰 價格：{' / '.join(prices)}\n"
-                    reply += "\n價格會由排程自動檢查，降價時會主動通知您！"
+                    reply += "\n價格會由系統自動檢查，降價時會主動通知您！"
 
             elif user_msg.startswith("+"):
                 item_id = user_msg[1:].strip()
