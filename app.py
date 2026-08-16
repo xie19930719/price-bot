@@ -84,8 +84,13 @@ def get_jpy_rate():
 
 def fetch_uniqlo_html(item_id, region="tw"):
     clean_id = item_id.strip()
-    # 針對台灣與日本官方網址結構進行直接訪問
-    url = f"https://www.uniqlo.com/{region}/products/E{clean_id}-000"
+    
+    # 依照正確的官方商品詳情頁結構 (支援 productCode 查詢參數)
+    # 台灣與日本的商品編碼通常帶有 13 碼或標準貨號，此處透過 product-detail.html 進行匹配
+    if region == "tw":
+        url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode=u00000000{clean_id}"
+    else:
+        url = f"https://www.uniqlo.com/jp/ja_JP/product-detail.html?productCode=u00000000{clean_id}"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -100,23 +105,20 @@ def fetch_uniqlo_html(item_id, region="tw"):
                 return None, None
             html_content = response.read().decode("utf-8", errors="ignore")
             
-        # 從頁面中的 JSON-LD 或 __NEXT_DATA__ 抓取商品名稱與價格
         name = None
         price_val = None
         
-        # 嘗試抓取 og:title 作為商品名稱備案
+        # 抓取 og:title 作為商品名稱
         title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html_content)
         if title_match:
             name = title_match.group(1).split('|')[0].strip()
 
-        # 嘗試從頁面內嵌的 JSON 結構中抓取價格
-        # Uniqlo 網頁通常包含包含價格的 script 標籤
+        # 從頁面中的價格標籤或 JSON 結構抓取數字
         price_match = re.findall(r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', html_content)
         if price_match:
-            # 取出合理範圍內的數字作為價格（避免抓到其他 ID 數字）
             prices = [float(p) for p in price_match if 100 < float(p) < 100000]
             if prices:
-                price_val = min(prices) # 通常最小價格即為特價或基本售價
+                price_val = min(prices)
 
         if name or price_val is not None:
             return name, price_val
