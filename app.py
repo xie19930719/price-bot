@@ -39,7 +39,6 @@ def init_db():
 
 init_db()
 
-# 動態抓取台日即時匯率
 def get_jpy_rate():
     try:
         req = urllib.request.Request(
@@ -56,10 +55,9 @@ def get_jpy_rate():
                     if rate > 0:
                         return rate
     except Exception as e:
-        print(f"Fetch exchange rate error: {e}")
+        print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-# 解析 API JSON
 def parse_uniqlo_json(res_data):
     result = res_data.get('result', {})
     if not result:
@@ -82,55 +80,36 @@ def parse_uniqlo_json(res_data):
 
     return name, price_val
 
-# 三重強效抓取 (API 直連 -> API 搜尋 -> 網頁備援)
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip()
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7' if region == 'tw' else 'ja-JP,ja;q=0.9,en-US;q=0.8'
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8' if region == 'tw' else 'ja-JP,ja;q=0.9'
     }
 
-    # 1. 嘗試 API 抓取
-    api_urls = [
+    # API 測試網址
+    urls = [
         f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/{clean_id}?priceCode=L2",
         f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?query={clean_id}&limit=1"
     ]
-    for url in api_urls:
+    for url in urls:
         try:
+            print(f"[DEBUG] Trying API URL: {url}")
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=4) as response:
+                print(f"[DEBUG] API Status: {response.status}")
                 if response.status == 200:
                     res_data = json.loads(response.read().decode('utf-8'))
                     name, price = parse_uniqlo_json(res_data)
-                    if name and price:
+                    print(f"[DEBUG] Parsed Result -> Name: {name}, Price: {price}")
+                    if name or price:
                         return name, price
-        except Exception:
-            pass
-
-    # 2. 終極備援：直接解析網頁 HTML
-    try:
-        web_url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={clean_id}" if region == "tw" else f"https://www.uniqlo.com/jp/ja/products/{clean_id}"
-        req = urllib.request.Request(web_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=4) as response:
-            html = response.read().decode('utf-8')
-            
-            # 從 Open Graph meta 標籤抓取商品名稱
-            name_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
-            # 從內容抓取價格數字
-            price_match = re.search(r'NT\$\s*([\d,]+)', html) if region == "tw" else re.search(r'¥\s*([\d,]+)', html)
-
-            name = name_match.group(1).split('|')[0].strip() if name_match else None
-            price = float(price_match.group(1).replace(',', '')) if price_match else None
-
-            if name or price:
-                return name or f"Uniqlo 商品 ({clean_id})", price
-    except Exception as e:
-        print(f"Web scraper fallback failed ({region}-{item_id}): {e}")
+        except Exception as e:
+            print(f"[ERROR] API Request failed ({region}-{item_id}): {e}")
 
     return None, None
 
-# 整合台日兩地資料
 def get_combined_info(item_id):
     name_tw, price_tw = fetch_uniqlo_official(item_id, "tw")
     name_jp, price_jp = fetch_uniqlo_official(item_id, "jp")
@@ -144,7 +123,6 @@ def get_combined_info(item_id):
 
     return brand, display_tw, price_tw, display_jp, price_jp
 
-# 格式化日幣轉台幣顯示
 def format_jp_price(price_jp, rate):
     if price_jp is None:
         return "🇯🇵 日本：未發售 / 無資料"
@@ -155,6 +133,19 @@ def format_jp_price(price_jp, rate):
 def home():
     return "電商台日價格追蹤 Bot 運作中！", 200
 
+# 🛠️ 專屬測試 Endpoint (用網址直接測試)
+@app.route("/test/<item_id>")
+def test_item(item_id):
+    brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
+    return {
+        "item_id": item_id,
+        "brand": brand,
+        "name_tw": n_tw,
+        "price_tw": p_tw,
+        "name_jp": n_jp,
+        "price_jp": p_jp
+    }, 200
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
@@ -164,51 +155,6 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK', 200
-
-@app.route("/check_prices", methods=['GET', 'POST'])
-def check_prices():
-    conn = sqlite3.connect('tracker.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, item_id, brand, name_tw, name_jp, price_tw, price_jp FROM tracked_items_v2")
-    rows = cursor.fetchall()
-
-    updated_count, notifications = 0, 0
-    rate = get_jpy_rate()
-
-    for user_id, item_id, brand, old_name_tw, old_name_jp, old_p_tw, old_p_jp in rows:
-        c_brand, c_name_tw, c_p_tw, c_name_jp, c_p_jp = get_combined_info(item_id)
-        if c_p_tw is not None or c_p_jp is not None:
-            drops = []
-            if old_p_tw and c_p_tw and c_p_tw < old_p_tw:
-                drops.append(f"🇹🇼 台灣特價: NT$ {int(c_p_tw)} (原價 NT$ {int(old_p_tw)})")
-            if old_p_jp and c_p_jp and c_p_jp < old_p_jp:
-                twd_approx = round(c_p_jp * rate)
-                drops.append(f"🇯🇵 日本特價: ¥ {int(c_p_jp)} (約 NT$ {twd_approx}, 原價 ¥ {int(old_p_jp)})")
-
-            if drops:
-                display_name = c_name_tw if c_name_tw else c_name_jp
-                msg = (f"🎉【降價通知】🎉\n"
-                       f"您追蹤的商品降價囉！\n\n"
-                       f"📦 [{brand}] {display_name} ({item_id})\n" +
-                       "\n".join(drops) + "\n\n"
-                       f"🔗 台灣官網: https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={item_id}\n"
-                       f"🔗 日本官網: https://www.uniqlo.com/jp/ja/products/{item_id}")
-                try:
-                    line_bot_api.push_message(user_id, TextSendMessage(text=msg))
-                    notifications += 1
-                except Exception as e:
-                    print(f"Push failed: {e}")
-
-            cursor.execute('''
-                UPDATE tracked_items_v2 
-                SET name_tw = ?, name_jp = ?, price_tw = ?, price_jp = ? 
-                WHERE user_id = ? AND item_id = ?
-            ''', (c_name_tw, c_name_jp, c_p_tw, c_p_jp, user_id, item_id))
-            updated_count += 1
-
-    conn.commit()
-    conn.close()
-    return f"Checked {updated_count} items, sent {notifications} notifications.", 200
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -265,16 +211,6 @@ def handle_message(event):
             reply = "💡 請使用正確格式：`+貨號`（例如 `+465185`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    elif user_msg.startswith("-"):
-        item_id = user_msg[1:].strip()
-        if item_id.isdigit():
-            cursor.execute("DELETE FROM tracked_items_v2 WHERE user_id = ? AND item_id = ?", (user_id, item_id))
-            conn.commit()
-            reply = f"🗑️ 已停止追蹤貨號 `{item_id}` 的商品。"
-        else:
-            reply = "💡 請使用正確格式：`-貨號`（例如 `-465185`）"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-
     elif user_msg.isdigit():
         item_id = user_msg
         brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
@@ -291,7 +227,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     else:
-        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `465185`）：快速查價\n• 輸入 `+貨號`（如 `+465185`）：加入降價追蹤\n• 輸入 `-貨號`（如 `-465185`）：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
+        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `465185`）：快速查價\n• 輸入 `+貨號`（如 `+465185`）：加入降價追蹤\n• 輸入 `-貨號`：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     conn.close()
