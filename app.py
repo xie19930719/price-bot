@@ -2,7 +2,7 @@ import os
 import json
 import sqlite3
 import urllib.request
-import urllib.error
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -10,18 +10,29 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ================= 填入你的 Token 與 Secret =================
-LINE_CHANNEL_SECRET = '551273045ea1be5721345edf4196aec7'
-LINE_CHANNEL_ACCESS_TOKEN = 'ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU='
-# ===========================================================
+# Token / Secret 請設定在環境變數，不要寫死在程式碼
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+DB_PATH = os.getenv("DB_PATH", "tracker.db")
+TAIWAN_TZ = timezone(timedelta(hours=8))
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    print("[WARNING] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 尚未設定。")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
+handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect('tracker.db')
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn = get_db()
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS tracked_items_v2 (
             user_id TEXT,
             item_id TEXT,
@@ -32,190 +43,321 @@ def init_db():
             price_jp REAL,
             PRIMARY KEY (user_id, item_id)
         )
-    ''')
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL,
+            region TEXT NOT NULL,
+            price REAL NOT NULL,
+            checked_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_price_history_item_region_time
+        ON price_history(item_id, region, id)
+    """)
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 def get_jpy_rate():
     try:
         req = urllib.request.Request(
             "https://rate.bot.com.tw/xrt/flats/003/day",
-            headers={'User-Agent': 'Mozilla/5.0'}
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req, timeout=3) as response:
-            html = response.read().decode('utf-8')
-            lines = html.splitlines()
-            for line in lines:
-                if "JPY" in line:
-                    parts = line.split(',')
-                    rate = float(parts[12]) if len(parts) > 12 else float(parts[2])
-                    if rate > 0:
-                        return rate
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+        for line in html.splitlines():
+            if "JPY" not in line:
+                continue
+            parts = line.split(",")
+            for index in (12, 2):
+                if len(parts) > index:
+                    try:
+                        rate = float(parts[index])
+                        if 0 < rate < 1:
+                            return rate
+                    except (ValueError, TypeError):
+                        pass
     except Exception as e:
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
+
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip()
-    
-    # 透過 Uniqlo 公開搜尋 API（極少被擋，能直接用貨號查到品名與價格）
-    url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=1"
-    
+    url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=10"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-        'Accept': 'application/json, text/plain, */*'
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json, text/plain, */*",
     }
-
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as response:
-            if response.status == 200:
-                res_data = json.loads(response.read().decode('utf-8'))
-                result = res_data.get('result', {})
-                items = result.get('items', [])
-                if items and len(items) > 0:
-                    item = items[0]
-                    name = item.get('name') or item.get('productName')
-                    price_val = None
-                    
-                    # 抓取價格
-                    if 'minPrice' in item and item['minPrice'] is not None:
-                        price_val = float(item['minPrice'])
-                    elif 'prices' in item and isinstance(item['prices'], dict):
-                        prices = item['prices']
-                        for k in ['promo', 'base', 'original']:
-                            if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
-                                price_val = float(prices[k]['value'])
-                                break
-                    
-                    return name, price_val
+        with urllib.request.urlopen(req, timeout=8) as response:
+            if response.status != 200:
+                return None, None
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        items = data.get("result", {}).get("items", [])
+        if not isinstance(items, list) or not items:
+            return None, None
+
+        # 優先找真正等於貨號的結果，找不到才退回第一筆
+        item = None
+        for candidate in items:
+            ids = [candidate.get(k) for k in ("id", "productCode", "itemCode", "code", "sku")]
+            if clean_id in [str(x).strip() for x in ids if x is not None]:
+                item = candidate
+                break
+        if item is None:
+            item = items[0]
+
+        name = item.get("name") or item.get("productName")
+        price_val = None
+        if item.get("minPrice") is not None:
+            try:
+                price_val = float(item["minPrice"])
+            except (ValueError, TypeError):
+                pass
+        if price_val is None and isinstance(item.get("prices"), dict):
+            for key in ("promo", "sale", "base", "original"):
+                value = item["prices"].get(key)
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if value is not None:
+                    try:
+                        price_val = float(value)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+        return name, price_val
     except Exception as e:
         print(f"[SEARCH API ERROR] {region}-{clean_id}: {e}")
-
     return None, None
+
 
 def get_combined_info(item_id):
     name_tw, price_tw = fetch_uniqlo_official(item_id, "tw")
     name_jp, price_jp = fetch_uniqlo_official(item_id, "jp")
-
     display_tw = name_tw if name_tw else name_jp
     display_jp = name_jp if name_jp else name_tw
-
-    brand = None
-    if price_tw is not None or price_jp is not None or display_tw is not None:
-        brand = "UNIQLO"
-
+    brand = "UNIQLO" if any(x is not None for x in (price_tw, price_jp, display_tw, display_jp)) else None
     return brand, display_tw, price_tw, display_jp, price_jp
+
 
 def format_jp_price(price_jp, rate):
     if price_jp is None:
         return "🇯🇵 日本：未發售 / 無資料"
-    twd_approx = round(price_jp * rate)
-    return f"🇯🇵 日本：¥ {int(price_jp)} (約 NT$ {twd_approx})"
+    return f"🇯🇵 日本：¥ {int(price_jp):,} (約 NT$ {round(price_jp * rate):,})"
+
+
+def now_tw():
+    return datetime.now(TAIWAN_TZ).isoformat(timespec="seconds")
+
+
+def get_previous_price(conn, item_id, region):
+    row = conn.execute(
+        "SELECT price FROM price_history WHERE item_id=? AND region=? ORDER BY id DESC LIMIT 1",
+        (item_id, region),
+    ).fetchone()
+    return float(row["price"]) if row else None
+
+
+def save_price_history(conn, item_id, region, price):
+    if price is not None:
+        conn.execute(
+            "INSERT INTO price_history(item_id,region,price,checked_at) VALUES(?,?,?,?)",
+            (item_id, region, float(price), now_tw()),
+        )
+
+
+def build_price_change_message(item_id, name_tw, name_jp, old_tw, new_tw, old_jp, new_jp, rate):
+    lines = ["🔔 UNIQLO 降價通知", f"🏷️ 貨號：{item_id}"]
+    name = name_tw or name_jp
+    if name:
+        lines.append(f"商品：{name}")
+    lines.append("")
+    if old_tw is not None and new_tw is not None and new_tw < old_tw:
+        lines.append(f"🇹🇼 台灣：NT$ {int(old_tw):,} → NT$ {int(new_tw):,}（降 NT$ {int(old_tw-new_tw):,}）")
+    if old_jp is not None and new_jp is not None and new_jp < old_jp:
+        lines.append(f"🇯🇵 日本：¥ {int(old_jp):,} → ¥ {int(new_jp):,}（降 ¥ {int(old_jp-new_jp):,}，約 NT$ {round(new_jp*rate):,}）")
+    lines.append("")
+    lines.append("💡 任一地區價格下降，我就會通知你。")
+    return "\n".join(lines)
+
+
+def check_all_prices():
+    conn = get_db()
+    rows = conn.execute("SELECT DISTINCT item_id FROM tracked_items_v2 ORDER BY item_id").fetchall()
+    if not rows:
+        conn.close()
+        return {"checked_items": 0, "notifications": 0, "message": "目前沒有追蹤商品。"}
+
+    rate = get_jpy_rate()
+    checked_items = 0
+    notifications = 0
+
+    for row in rows:
+        item_id = row["item_id"]
+        try:
+            brand, name_tw, price_tw, name_jp, price_jp = get_combined_info(item_id)
+            if not brand:
+                print(f"[CHECK] {item_id}: 找不到商品")
+                continue
+
+            old_tw = get_previous_price(conn, item_id, "tw")
+            old_jp = get_previous_price(conn, item_id, "jp")
+            dropped_tw = old_tw is not None and price_tw is not None and price_tw < old_tw
+            dropped_jp = old_jp is not None and price_jp is not None and price_jp < old_jp
+
+            save_price_history(conn, item_id, "tw", price_tw)
+            save_price_history(conn, item_id, "jp", price_jp)
+            conn.execute(
+                "UPDATE tracked_items_v2 SET price_tw=COALESCE(?,price_tw), price_jp=COALESCE(?,price_jp), name_tw=COALESCE(?,name_tw), name_jp=COALESCE(?,name_jp) WHERE item_id=?",
+                (price_tw, price_jp, name_tw, name_jp, item_id),
+            )
+
+            if dropped_tw or dropped_jp:
+                users = conn.execute("SELECT DISTINCT user_id FROM tracked_items_v2 WHERE item_id=?", (item_id,)).fetchall()
+                message = build_price_change_message(item_id, name_tw, name_jp, old_tw, price_tw, old_jp, price_jp, rate)
+                if line_bot_api:
+                    for user in users:
+                        try:
+                            line_bot_api.push_message(user["user_id"], TextSendMessage(text=message))
+                            notifications += 1
+                        except Exception as e:
+                            print(f"[PUSH ERROR] item={item_id}, user={user['user_id']}: {e}")
+
+            conn.commit()
+            checked_items += 1
+            print(f"[CHECK] {item_id}: TW={price_tw}, JP={price_jp}, oldTW={old_tw}, oldJP={old_jp}")
+        except Exception as e:
+            print(f"[CHECK ERROR] {item_id}: {e}")
+
+    conn.close()
+    return {"checked_items": checked_items, "notifications": notifications, "message": "價格檢查完成。"}
+
 
 @app.route("/")
 def home():
     return "電商台日價格追蹤 Bot 運作中！", 200
 
+
 @app.route("/test/<item_id>")
 def test_item(item_id):
     brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
-    return {
-        "item_id": item_id,
-        "brand": brand,
-        "name_tw": n_tw,
-        "price_tw": p_tw,
-        "name_jp": n_jp,
-        "price_jp": p_jp
-    }, 200
+    return {"item_id": item_id, "brand": brand, "name_tw": n_tw, "price_tw": p_tw, "name_jp": n_jp, "price_jp": p_jp}, 200
 
-@app.route("/callback", methods=['POST'])
+
+@app.route("/cron/check", methods=["GET", "POST"])
+def cron_check():
+    # 外部排程可呼叫此網址；設定 CRON_SECRET 後需帶 X-Cron-Secret header
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        abort(403)
+    return check_all_prices(), 200
+
+
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature', '')
+    if not handler:
+        abort(500)
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return 'OK', 200
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] {e}")
+        abort(500)
+    return "OK", 200
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_id = event.source.user_id
-    user_msg = event.message.text.strip()
 
-    conn = sqlite3.connect('tracker.db')
-    cursor = conn.cursor()
-    rate = get_jpy_rate()
+if handler:
+    @handler.add(MessageEvent, message=TextMessage)
+    def handle_message(event):
+        user_id = event.source.user_id
+        user_msg = event.message.text.strip()
+        conn = get_db()
+        try:
+            if user_msg == "清單":
+                items = conn.execute("SELECT item_id,brand,name_tw,name_jp,price_tw,price_jp FROM tracked_items_v2 WHERE user_id=? ORDER BY item_id", (user_id,)).fetchall()
+                if not items:
+                    reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+475355`）即可開始追蹤！"
+                else:
+                    rate = get_jpy_rate()
+                    reply = "📋 您目前追蹤的商品清單：\n"
+                    for item in items:
+                        reply += f"\n• [{item['brand']}] {item['item_id']}\n"
+                        if item["name_tw"]: reply += f"  🇹🇼 中文：{item['name_tw']}\n"
+                        if item["name_jp"]: reply += f"  🇯🇵 日文：{item['name_jp']}\n"
+                        prices = []
+                        if item["price_tw"] is not None: prices.append(f"NT$ {int(item['price_tw']):,}")
+                        if item["price_jp"] is not None: prices.append(f"¥ {int(item['price_jp']):,} (約 NT$ {round(item['price_jp']*rate):,})")
+                        if prices: reply += f"  💰 價格：{' / '.join(prices)}\n"
+                    reply += "\n價格會由排程自動檢查，降價時會主動通知您！"
 
-    if user_msg == "清單":
-        cursor.execute("SELECT item_id, brand, name_tw, name_jp, price_tw, price_jp FROM tracked_items_v2 WHERE user_id = ?", (user_id,))
-        items = cursor.fetchall()
-        if not items:
-            reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+475355`）即可開始追蹤！"
-        else:
-            reply = "📋 您目前追蹤的商品清單：\n"
-            for item_id, brand, n_tw, n_jp, p_tw, p_jp in items:
-                reply += f"\n• [{brand}] {item_id}\n"
-                if n_tw: reply += f"  🇹🇼 中文: {n_tw}\n"
-                if n_jp: reply += f"  🇯🇵 日文: {n_jp}\n"
-                
-                prices_str = []
-                if p_tw: prices_str.append(f"NT$ {int(p_tw)}")
-                if p_jp: 
-                    twd = round(p_jp * rate)
-                    prices_str.append(f"¥ {int(p_jp)} (約 NT$ {twd})")
-                reply += f"  💰 價格: {' / '.join(prices_str)}\n"
-            reply += "\n每天系統會自動檢查台日兩地的價格變動！"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            elif user_msg.startswith("+"):
+                item_id = user_msg[1:].strip()
+                if not item_id.isdigit():
+                    reply = "💡 請使用正確格式：`+貨號`（例如 `+475355`）"
+                else:
+                    brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
+                    if not brand:
+                        reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
+                    else:
+                        conn.execute("INSERT OR REPLACE INTO tracked_items_v2(user_id,item_id,brand,name_tw,name_jp,price_tw,price_jp) VALUES(?,?,?,?,?,?,?)", (user_id,item_id,brand,n_tw,n_jp,p_tw,p_jp))
+                        if p_tw is not None and get_previous_price(conn,item_id,"tw") is None: save_price_history(conn,item_id,"tw",p_tw)
+                        if p_jp is not None and get_previous_price(conn,item_id,"jp") is None: save_price_history(conn,item_id,"jp",p_jp)
+                        conn.commit()
+                        rate = get_jpy_rate()
+                        reply = f"✅ 已成功加入追蹤！\n\n🏷️ 貨號：{item_id}\n"
+                        if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
+                        if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
+                        reply += "\n💰 目前價格：\n"
+                        reply += f"🇹🇼 台灣：NT$ {int(p_tw):,}\n" if p_tw is not None else "🇹🇼 台灣：未發售 / 無資料\n"
+                        reply += format_jp_price(p_jp, rate) + "\n\n📌 已建立目前價格基準，之後降價會主動通知您！"
 
-    elif user_msg.startswith("+"):
-        item_id = user_msg[1:].strip()
-        if item_id.isdigit():
-            brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
-            if brand:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO tracked_items_v2 
-                    (user_id, item_id, brand, name_tw, name_jp, price_tw, price_jp) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (user_id, item_id, brand, n_tw, n_jp, p_tw, p_jp))
-                conn.commit()
+            elif user_msg.startswith("-"):
+                item_id = user_msg[1:].strip()
+                if not item_id.isdigit():
+                    reply = "💡 請使用正確格式：`-貨號`（例如 `-475355`）"
+                else:
+                    result = conn.execute("DELETE FROM tracked_items_v2 WHERE user_id=? AND item_id=?", (user_id,item_id))
+                    conn.commit()
+                    reply = f"🗑️ 已取消追蹤貨號：{item_id}" if result.rowcount else f"⚠️ 你目前沒有追蹤貨號：{item_id}"
 
-                reply = f"✅ 已成功加入追蹤！\n\n🏷️ 貨號：{item_id}\n"
-                if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
-                if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
-                reply += "\n💰 目前價格：\n"
-                reply += f"🇹🇼 台灣：NT$ {int(p_tw)}\n" if p_tw else "🇹🇼 台灣：未發售 / 無資料\n"
-                reply += format_jp_price(p_jp, rate) + "\n"
-                reply += "\n任一地區價格調降時，我都會主動通知您！"
+            elif user_msg.isdigit():
+                item_id = user_msg
+                brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
+                if not brand:
+                    reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
+                else:
+                    rate = get_jpy_rate()
+                    reply = f"🔍 查價結果（貨號：{item_id}）\n\n"
+                    if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
+                    if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
+                    reply += "\n💰 目前價格：\n"
+                    reply += f"🇹🇼 台灣：NT$ {int(p_tw):,}\n" if p_tw is not None else "🇹🇼 台灣：未發售 / 無資料\n"
+                    reply += format_jp_price(p_jp, rate) + f"\n\n💡 如需追蹤價格變動，請輸入 `+{item_id}`"
+
             else:
-                reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
-        else:
-            reply = "💡 請使用正確格式：`+貨號`（例如 `+475355`）"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+                reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `475355`）：快速查價\n• 輸入 `+貨號`（如 `+475355`）：加入降價追蹤\n• 輸入 `-貨號`（如 `-475355`）：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
 
-    elif user_msg.isdigit():
-        item_id = user_msg
-        brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
-        if brand:
-            reply = f"🔍 查價結果 (貨號：{item_id})\n\n"
-            if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
-            if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
-            reply += "\n💰 目前價格：\n"
-            reply += f"🇹🇼 台灣：NT$ {int(p_tw)}\n" if p_tw else "🇹🇼 台灣：未發售 / 無資料\n"
-            reply += format_jp_price(p_jp, rate) + "\n"
-            reply += f"\n💡 如需追蹤價格變動，請輸入 `+{item_id}`"
-        else:
-            reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        except Exception as e:
+            print(f"[MESSAGE ERROR] user={user_id}: {e}")
+            try:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 系統暫時發生錯誤，請稍後再試。"))
+            except Exception as reply_error:
+                print(f"[REPLY ERROR] {reply_error}")
+        finally:
+            conn.close()
 
-    else:
-        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `475355`）：快速查價\n• 輸入 `+貨號`（如 `+475355`）：加入降價追蹤\n• 輸入 `-貨號`：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-
-    conn.close()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
