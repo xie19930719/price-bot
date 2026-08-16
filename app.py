@@ -11,7 +11,6 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# Token / Secret 請設定在環境變數，或直接填在此處
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "551273045ea1be5721345edf4196aec7")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU=")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
@@ -49,10 +48,6 @@ def init_db():
             checked_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_price_history_item_region_time
-        ON price_history(item_id, region, id)
-    """)
     conn.commit()
     conn.close()
 
@@ -85,16 +80,18 @@ def get_jpy_rate():
 def fetch_uniqlo_html(item_id, region="tw"):
     clean_id = item_id.strip()
     
-    # 依照正確的官方商品詳情頁結構 (支援 productCode 查詢參數)
-    # 台灣與日本的商品編碼通常帶有 13 碼或標準貨號，此處透過 product-detail.html 進行匹配
+    # 修正：補上您提供的正確路由結構，並將貨號補齊 13 碼格式（前面補 0）
+    padded_id = clean_id.zfill(8)
+    product_code = f"u0000000{padded_id}"
+    
     if region == "tw":
-        url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode=u00000000{clean_id}"
+        url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={product_code}"
     else:
-        url = f"https://www.uniqlo.com/jp/ja_JP/product-detail.html?productCode=u00000000{clean_id}"
+        url = f"https://www.uniqlo.com/jp/ja_JP/product-detail.html?productCode={product_code}"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*|q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     
