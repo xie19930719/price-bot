@@ -1,6 +1,8 @@
 import os
+import re
 import sqlite3
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -37,49 +39,70 @@ def init_db():
 init_db()
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
 }
 
-# 1. 透過搜尋 API 將 6 位數貨號轉為內部 Product Code
-def search_product_code(query, region="tw", brand="uniqlo"):
-    domain = "uniqlo.com" if brand == "uniqlo" else "gu-global.com"
-    url = f"https://www.{domain}/{region}/api/commerce/v5/{region}/products?query={query}&limit=1"
+# 抓取單一地區/品牌的商品資訊（混合網頁解析與開放 API）
+def fetch_item_info(item_id, region="tw", brand="uniqlo"):
+    formatted_id = item_id.zfill(6)
+    
+    # 建立網頁與搜尋 API URL
+    if brand == "uniqlo":
+        if region == "tw":
+            page_url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={formatted_id}"
+            api_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
+        else:
+            page_url = f"https://www.uniqlo.com/jp/ja/products/{formatted_id}"
+            api_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
+    else: # GU
+        if region == "tw":
+            page_url = f"https://www.gu-global.com/tw/zh_TW/product-detail.html?productCode={formatted_id}"
+            api_url = f"https://www.gu-global.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
+        else:
+            page_url = f"https://www.gu-global.com/jp/ja/products/{formatted_id}"
+            api_url = f"https://www.gu-global.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
+
+    # 方法 1：嘗試呼叫開放搜尋 API
     try:
-        res = requests.get(url, headers=HEADERS, timeout=5)
+        res = requests.get(api_url, headers=HEADERS, timeout=4)
         if res.status_code == 200:
             data = res.json()
             items = data.get('result', {}).get('items', [])
             if items:
-                return items[0].get('productId') or items[0].get('productCode')
-    except Exception as e:
-        print(f"Search error ({brand}-{region}): {e}")
-    return None
-
-# 2. 抓取具體商品的名稱與價格
-def fetch_product_details(product_code, region="tw", brand="uniqlo"):
-    if not product_code:
-        return None, None
-    domain = "uniqlo.com" if brand == "uniqlo" else "gu-global.com"
-    url = f"https://www.{domain}/{region}/api/commerce/v5/{region}/products/{product_code}?priceGroup=official&expand=prices"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            result = data.get('result', {})
-            items = result.get('items', [result.get('product', {})]) if 'items' in result or 'product' in result else []
-            for item in items:
+                item = items[0]
                 name = item.get('name')
                 prices = item.get('prices', {})
                 price_val = None
-                for key in ['base', 'promo', 'original']:
-                    if key in prices and prices[key].get('value') is not None:
-                        price_val = prices[key]['value']
+                for k in ['base', 'promo', 'original']:
+                    if k in prices and prices[k].get('value') is not None:
+                        price_val = float(prices[k]['value'])
                         break
-                if name and price_val is not None:
-                    return name, float(price_val)
+                if name and price_val:
+                    return name, price_val
     except Exception as e:
-        print(f"Fetch details error ({brand}-{region}): {e}")
+        print(f"API Error ({brand}-{region}): {e}")
+
+    # 方法 2：網頁爬蟲備用方案
+    try:
+        res = requests.get(page_url, headers=HEADERS, timeout=5)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, 'html.parser')
+            # 從 meta og:title 抓取商品名稱
+            title_tag = soup.find('meta', property='og:title') or soup.find('title')
+            name = title_tag['content'].strip() if title_tag and 'content' in title_tag.attrs else None
+            
+            # 尋找價格數字
+            prices_found = re.findall(r'NT\$?\s*([0-9,]+)|¥\s*([0-9,]+)|([0-9,]+)\s*元', res.text)
+            if prices_found and name:
+                raw_price = next((p for group in prices_found for p in group if p), None)
+                if raw_price:
+                    price_val = float(raw_price.replace(',', ''))
+                    return name, price_val
+    except Exception as e:
+        print(f"Scrape Error ({brand}-{region}): {e}")
+
     return None, None
 
 # 跨國與跨品牌整合查詢
@@ -88,23 +111,16 @@ def get_combined_info(item_id):
     name_tw, price_tw = None, None
     name_jp, price_jp = None, None
 
-    # 搜尋 Uniqlo
-    code_tw = search_product_code(item_id, "tw", "uniqlo") or item_id
-    code_jp = search_product_code(item_id, "jp", "uniqlo") or item_id
-
-    name_tw, price_tw = fetch_product_details(code_tw, "tw", "uniqlo")
-    name_jp, price_jp = fetch_product_details(code_jp, "jp", "uniqlo")
+    # 1. 先查 Uniqlo
+    name_tw, price_tw = fetch_item_info(item_id, "tw", "uniqlo")
+    name_jp, price_jp = fetch_item_info(item_id, "jp", "uniqlo")
 
     if price_tw is not None or price_jp is not None:
         brand = "UNIQLO"
     else:
-        # 搜尋 GU
-        code_tw_g = search_product_code(item_id, "tw", "gu") or item_id
-        code_jp_g = search_product_code(item_id, "jp", "gu") or item_id
-
-        name_tw, price_tw = fetch_product_details(code_tw_g, "tw", "gu")
-        name_jp, price_jp = fetch_product_details(code_jp_g, "jp", "gu")
-
+        # 2. 查 GU
+        name_tw, price_tw = fetch_item_info(item_id, "tw", "gu")
+        name_jp, price_jp = fetch_item_info(item_id, "jp", "gu")
         if price_tw is not None or price_jp is not None:
             brand = "GU"
 
