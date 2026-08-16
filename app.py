@@ -39,96 +39,83 @@ def init_db():
 init_db()
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 }
 
-# 抓取單一地區/品牌的商品資訊（混合網頁解析與開放 API）
-def fetch_item_info(item_id, region="tw", brand="uniqlo"):
-    formatted_id = item_id.zfill(6)
-    
-    # 建立網頁與搜尋 API URL
-    if brand == "uniqlo":
-        if region == "tw":
-            page_url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={formatted_id}"
-            api_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
-        else:
-            page_url = f"https://www.uniqlo.com/jp/ja/products/{formatted_id}"
-            api_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
-    else: # GU
-        if region == "tw":
-            page_url = f"https://www.gu-global.com/tw/zh_TW/product-detail.html?productCode={formatted_id}"
-            api_url = f"https://www.gu-global.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
-        else:
-            page_url = f"https://www.gu-global.com/jp/ja/products/{formatted_id}"
-            api_url = f"https://www.gu-global.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
-
-    # 方法 1：嘗試呼叫開放搜尋 API
+# 動態抓取日幣對台幣匯率（備用為 0.22）
+def get_jpy_rate():
     try:
-        res = requests.get(api_url, headers=HEADERS, timeout=4)
+        res = requests.get("https://rate.bot.com.tw/xrt/flats/003/day", timeout=3)
         if res.status_code == 200:
-            data = res.json()
-            items = data.get('result', {}).get('items', [])
-            if items:
-                item = items[0]
-                name = item.get('name')
-                prices = item.get('prices', {})
-                price_val = None
-                for k in ['base', 'promo', 'original']:
-                    if k in prices and prices[k].get('value') is not None:
-                        price_val = float(prices[k]['value'])
-                        break
-                if name and price_val:
-                    return name, price_val
+            lines = res.text.splitlines()
+            for line in lines:
+                if "JPY" in line:
+                    parts = line.split(',')
+                    # 抓取現金賣出或即期賣出價
+                    rate = float(parts[12]) if len(parts) > 12 else float(parts[2])
+                    if rate > 0:
+                        return rate
     except Exception as e:
-        print(f"API Error ({brand}-{region}): {e}")
+        print(f"Fetch exchange rate error: {e}")
+    return 0.22
 
-    # 方法 2：網頁爬蟲備用方案
+# 抓取 uq.goodjack.tw 上的台灣或日本商品頁面
+def fetch_goodjack_info(item_id, region="tw"):
+    if region == "tw":
+        url = f"https://uq.goodjack.tw/item/{item_id}"
+    else:
+        url = f"https://uq.goodjack.tw/japan/item/{item_id}"
+
     try:
-        res = requests.get(page_url, headers=HEADERS, timeout=5)
+        res = requests.get(url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
-            # 從 meta og:title 抓取商品名稱
-            title_tag = soup.find('meta', property='og:title') or soup.find('title')
-            name = title_tag['content'].strip() if title_tag and 'content' in title_tag.attrs else None
             
-            # 尋找價格數字
-            prices_found = re.findall(r'NT\$?\s*([0-9,]+)|¥\s*([0-9,]+)|([0-9,]+)\s*元', res.text)
-            if prices_found and name:
-                raw_price = next((p for group in prices_found for p in group if p), None)
-                if raw_price:
-                    price_val = float(raw_price.replace(',', ''))
-                    return name, price_val
+            title_tag = soup.find('h1') or soup.find('title')
+            name = None
+            if title_tag:
+                name_text = title_tag.text.strip()
+                name = re.sub(r'\|.*', '', name_text).strip()
+            
+            price_val = None
+            text_content = soup.get_text()
+            
+            if region == "tw":
+                match = re.search(r'NT\$?\s*([0-9,]+)', text_content)
+            else:
+                match = re.search(r'¥\s*([0-9,]+)', text_content)
+
+            if match:
+                price_val = float(match.group(1).replace(',', ''))
+
+            if name and price_val:
+                return name, price_val
     except Exception as e:
-        print(f"Scrape Error ({brand}-{region}): {e}")
+        print(f"Goodjack Fetch Error ({region}-{item_id}): {e}")
 
     return None, None
 
-# 跨國與跨品牌整合查詢
+# 整合查詢：同時搜尋台日資料
 def get_combined_info(item_id):
+    name_tw, price_tw = fetch_goodjack_info(item_id, "tw")
+    name_jp, price_jp = fetch_goodjack_info(item_id, "jp")
+
     brand = None
-    name_tw, price_tw = None, None
-    name_jp, price_jp = None, None
-
-    # 1. 先查 Uniqlo
-    name_tw, price_tw = fetch_item_info(item_id, "tw", "uniqlo")
-    name_jp, price_jp = fetch_item_info(item_id, "jp", "uniqlo")
-
     if price_tw is not None or price_jp is not None:
-        brand = "UNIQLO"
-    else:
-        # 2. 查 GU
-        name_tw, price_tw = fetch_item_info(item_id, "tw", "gu")
-        name_jp, price_jp = fetch_item_info(item_id, "jp", "gu")
-        if price_tw is not None or price_jp is not None:
-            brand = "GU"
+        brand = "UNIQLO/GU"
 
     return brand, name_tw, price_tw, name_jp, price_jp
 
+# 格式化日幣轉台幣文字
+def format_jp_price(price_jp, rate):
+    if price_jp is None:
+        return "🇯🇵 日本：未發售 / 無資料"
+    twd_approx = round(price_jp * rate)
+    return f"🇯🇵 日本：¥ {int(price_jp)} (約 NT$ {twd_approx})"
+
 @app.route("/")
 def home():
-    return "H電商台日價格追蹤 Bot 運作中！", 200
+    return "H電商台日價格追蹤 Bot (Goodjack版) 運作中！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -148,6 +135,7 @@ def check_prices():
     rows = cursor.fetchall()
 
     updated_count, notifications = 0, 0
+    rate = get_jpy_rate()
 
     for user_id, item_id, brand, old_name_tw, old_name_jp, old_p_tw, old_p_jp in rows:
         c_brand, c_name_tw, c_p_tw, c_name_jp, c_p_jp = get_combined_info(item_id)
@@ -156,7 +144,8 @@ def check_prices():
             if old_p_tw and c_p_tw and c_p_tw < old_p_tw:
                 drops.append(f"🇹🇼 台灣特價: NT$ {int(c_p_tw)} (原價 NT$ {int(old_p_tw)})")
             if old_p_jp and c_p_jp and c_p_jp < old_p_jp:
-                drops.append(f"🇯🇵 日本特價: ¥ {int(c_p_jp)} (原價 ¥ {int(old_p_jp)})")
+                twd_approx = round(c_p_jp * rate)
+                drops.append(f"🇯🇵 日本特價: ¥ {int(c_p_jp)} (約 NT$ {twd_approx}, 原價 ¥ {int(old_p_jp)})")
 
             if drops:
                 display_name = c_name_tw if c_name_tw else c_name_jp
@@ -164,8 +153,8 @@ def check_prices():
                        f"您追蹤的商品降價囉！\n\n"
                        f"📦 [{brand}] {display_name} ({item_id})\n" +
                        "\n".join(drops) + "\n\n"
-                       f"🔗 台灣官網: https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={item_id}\n"
-                       f"🔗 日本官網: https://www.uniqlo.com/jp/ja/products/{item_id}")
+                       f"🔗 台灣歷史價格: https://uq.goodjack.tw/item/{item_id}\n"
+                       f"🔗 日本歷史價格: https://uq.goodjack.tw/japan/item/{item_id}")
                 try:
                     line_bot_api.push_message(user_id, TextSendMessage(text=msg))
                     notifications += 1
@@ -190,12 +179,13 @@ def handle_message(event):
 
     conn = sqlite3.connect('tracker.db')
     cursor = conn.cursor()
+    rate = get_jpy_rate()
 
     if user_msg == "清單":
         cursor.execute("SELECT item_id, brand, name_tw, name_jp, price_tw, price_jp FROM tracked_items_v2 WHERE user_id = ?", (user_id,))
         items = cursor.fetchall()
         if not items:
-            reply = "📋 目前沒有追蹤任何商品。\n傳送 `+貨號`（例如 `+484808`）即可開始追蹤！"
+            reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+484808`）即可開始追蹤！"
         else:
             reply = "📋 您目前追蹤的商品清單：\n"
             for item_id, brand, n_tw, n_jp, p_tw, p_jp in items:
@@ -205,11 +195,14 @@ def handle_message(event):
                 
                 prices_str = []
                 if p_tw: prices_str.append(f"NT$ {int(p_tw)}")
-                if p_jp: prices_str.append(f"¥ {int(p_jp)}")
+                if p_jp: 
+                    twd = round(p_jp * rate)
+                    prices_str.append(f"¥ {int(p_jp)} (約 NT$ {twd})")
                 reply += f"  💰 價格: {' / '.join(prices_str)}\n"
             reply += "\n每天系統會自動檢查台日兩地的價格變動！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
+    # 指令：+貨號 (新增追蹤)
     elif user_msg.startswith("+"):
         item_id = user_msg[1:].strip()
         if item_id.isdigit():
@@ -222,19 +215,20 @@ def handle_message(event):
                 ''', (user_id, item_id, brand, n_tw, n_jp, p_tw, p_jp))
                 conn.commit()
 
-                reply = f"✅ 已成功加入追蹤！\n\n🏷️ 品牌：{brand}\n"
+                reply = f"✅ 已成功加入追蹤！\n\n🏷️ 貨號：{item_id}\n"
                 if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
                 if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
                 reply += "\n💰 目前價格：\n"
                 reply += f"🇹🇼 台灣：NT$ {int(p_tw)}\n" if p_tw else "🇹🇼 台灣：未發售 / 無資料\n"
-                reply += f"🇯🇵 日本：¥ {int(p_jp)}\n" if p_jp else "🇯🇵 日本：未發售 / 無資料\n"
+                reply += format_jp_price(p_jp, rate) + "\n"
                 reply += "\n任一地區價格調降時，我都會主動通知您！"
             else:
-                reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認 Uniqlo 或 GU 的貨號是否正確。"
+                reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
         else:
             reply = "💡 請使用正確格式：`+貨號`（例如 `+484808`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
+    # 指令：-貨號 (移除追蹤)
     elif user_msg.startswith("-"):
         item_id = user_msg[1:].strip()
         if item_id.isdigit():
@@ -245,8 +239,24 @@ def handle_message(event):
             reply = "💡 請使用正確格式：`-貨號`（例如 `-484808`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
+    # 指令：純數字貨號 (純查價，不加入追蹤)
+    elif user_msg.isdigit():
+        item_id = user_msg
+        brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
+        if brand:
+            reply = f"🔍 查價結果 (貨號：{item_id})\n\n"
+            if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
+            if n_jp: reply += f"🇯🇵 日文：{n_jp}\n"
+            reply += "\n💰 目前價格：\n"
+            reply += f"🇹🇼 台灣：NT$ {int(p_tw)}\n" if p_tw else "🇹🇼 台灣：未發售 / 無資料\n"
+            reply += format_jp_price(p_jp, rate) + "\n"
+            reply += f"\n💡 如需追蹤價格變動，請輸入 `+{item_id}`"
+        else:
+            reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
     else:
-        reply = "🤖 可用指令：\n• 輸入 `清單`：查看所有追蹤商品\n• 輸入 `+貨號`：加入追蹤 (台日 Uniqlo / GU 雙平台通用)\n• 輸入 `-貨號`：移除追蹤"
+        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `484808`）：快速查價\n• 輸入 `+貨號`（如 `+484808`）：加入降價追蹤\n• 輸入 `-貨號`（如 `-484808`）：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     conn.close()
