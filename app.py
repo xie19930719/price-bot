@@ -62,34 +62,44 @@ def parse_html_for_data(html_str):
     name = None
     price = None
 
-    # 1. 嘗試尋找 __NEXT_DATA__ JSON 區塊
+    # 1. 嘗試從 __NEXT_DATA__ 抓取完整商品資訊
     next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_str, re.DOTALL)
     if next_data_match:
         try:
             json_data = json.loads(next_data_match.group(1))
-            # 嘗試深層解析
-            product = json_data.get('props', {}).get('pageProps', {}).get('product', {})
+            # 遞迴或多路徑尋找 product 物件
+            page_props = json_data.get('props', {}).get('pageProps', {})
+            product = page_props.get('product') or page_props.get('initialState', {}).get('product', {})
+            if not product and 'dehydratedState' in page_props:
+                # 尋找 react-query 快取中的商品資料
+                queries = page_props['dehydratedState'].get('queries', [])
+                for q in queries:
+                    q_data = q.get('state', {}).get('data', {})
+                    if isinstance(q_data, dict):
+                        p_info = q_data.get('result', {} ) or q_data
+                        if 'name' in p_info or 'productName' in p_info:
+                            product = p_info
+                            break
+
             if product:
                 name = product.get('name') or product.get('productName')
-                min_p = product.get('minPrice')
+                min_p = product.get('minPrice') or product.get('price')
                 if min_p is not None:
                     price = float(min_p)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[JSON PARSE ERROR] {e}")
 
-    # 2. 如果沒抓到，用正則表達式備用匹配標題與價格
+    # 2. 備用方案：從網頁內嵌的 JSON 結構以正規表達式抓取 productName 與 price
     if not name:
-        title_match = re.search(r'<title>(.*?)</title>', html_str, re.IGNORECASE)
-        if title_match:
-            raw_title = title_match.group(1)
-            name = raw_title.split('|')[0].replace('UNIQLO', '').strip()
+        name_match = re.search(r'"productName"\s*:\s*"([^"]+)"', html_str) or re.search(r'"name"\s*:\s*"([^"]+)"', html_str)
+        if name_match:
+            name = name_match.group(1)
 
     if not price:
-        # 匹配 ¥ 或 NT$ 數字
-        price_match = re.search(r'(?:NT\$|NT\$\s*|￥|¥)\s*([0-9,]+)', html_str)
+        price_match = re.search(r'"minPrice"\s*:\s*([0-9.]+)', html_str) or re.search(r'"price"\s*:\s*([0-9.]+)', html_str)
         if price_match:
             try:
-                price = float(price_match.group(1).replace(',', ''))
+                price = float(price_match.group(1))
             except ValueError:
                 pass
 
@@ -99,48 +109,23 @@ def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip().zfill(6)
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9',
-        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none'
     }
 
-    # 同時測試 HTML 頁面 與 API
-    urls = []
-    if region == "tw":
-        urls.append(f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode=u00000000{clean_id}")
-        urls.append(f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/E{clean_id}-000?priceCode=L2")
-    else:
-        urls.append(f"https://www.uniqlo.com/jp/ja/products/E{clean_id}-000")
-        urls.append(f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/E{clean_id}-000?priceCode=L2")
+    url = f"https://www.uniqlo.com/{region}/zh_TW/product-detail.html?productCode=u00000000{clean_id}" if region == "tw" else f"https://www.uniqlo.com/jp/ja/products/E{clean_id}-000"
 
-    for url in urls:
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as response:
-                if response.status == 200:
-                    content = response.read().decode('utf-8')
-                    # 如果是 JSON
-                    if content.startswith('{'):
-                        res_data = json.loads(content)
-                        res = res_data.get('result', {})
-                        if 'items' in res and len(res['items']) > 0:
-                            res = res['items'][0]
-                        n = res.get('name')
-                        p = res.get('minPrice')
-                        if n or p:
-                            return n, float(p) if p else None
-                    else:
-                        # 如果是 HTML 頁面
-                        n, p = parse_html_for_data(content)
-                        if n or p:
-                            return n, p
-        except Exception as e:
-            print(f"[FETCH ERROR] {url}: {e}")
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as response:
+            if response.status == 200:
+                content = response.read().decode('utf-8')
+                name, price = parse_html_for_data(content)
+                if name or price:
+                    return name, price
+    except Exception as e:
+        print(f"[FETCH ERROR] {region}-{clean_id}: {e}")
 
     return None, None
 
