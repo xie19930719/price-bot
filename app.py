@@ -34,9 +34,9 @@ def init_db():
 
 init_db()
 
-# 抓取 Uniqlo 價格與名稱
+# 抓取日本 Uniqlo 價格與名稱
 def get_uniqlo_info(item_id):
-    url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{item_id}?priceGroup=official"
+    url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{item_id}?priceGroup=official"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         res = requests.get(url, headers=headers, timeout=10)
@@ -84,9 +84,9 @@ def check_prices():
                 msg = (f"🎉【降價通知】🎉\n"
                        f"您追蹤的商品降價囉！\n\n"
                        f"📦 {current_name} ({item_id})\n"
-                       f"原價: NT$ {int(last_price)}\n"
-                       f"💥 特價: NT$ {int(current_price)} (省下 NT$ {int(drop_amount)})\n\n"
-                       f"🔗 傳送門: https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={item_id}")
+                       f"原價: ¥ {int(last_price)}\n"
+                       f"💥 特價: ¥ {int(current_price)} (省下 ¥ {int(drop_amount)})\n\n"
+                       f"🔗 傳送門: https://www.uniqlo.com/jp/ja/products/{item_id}")
                 try:
                     line_bot_api.push_message(user_id, TextSendMessage(text=msg))
                     discount_notifications += 1
@@ -120,7 +120,7 @@ def handle_message(event):
         else:
             reply = "📋 您目前追蹤的商品清單：\n"
             for item_id, name, price in items:
-                reply += f"\n• {name} ({item_id})\n  紀錄價格: NT$ {int(price)}"
+                reply += f"\n• {name} ({item_id})\n  紀錄價格: ¥ {int(price)}"
             reply += "\n\n每天系統會自動為您檢查價格變動！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
@@ -135,7 +135,7 @@ def handle_message(event):
                     (user_id, item_id, name, price)
                 )
                 conn.commit()
-                reply = f"✅ 已加入追蹤！\n\n📦 商品：{name}\n💰 目前價格：NT$ {int(price)}\n\n價格若有調降，我會在第一時間主動發訊息通知您！"
+                reply = f"✅ 已加入追蹤！\n\n📦 商品：{name}\n💰 目前價格：¥ {int(price)}\n\n價格若有調降，我會在第一時間主動發訊息通知您！"
             else:
                 reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
         else:
