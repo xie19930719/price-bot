@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import re
 import urllib.request
 import urllib.error
 from flask import Flask, request, abort
@@ -58,13 +59,12 @@ def get_jpy_rate():
         print(f"Fetch exchange rate error: {e}")
     return 0.22
 
-# 解析 Uniqlo 官方 JSON 格式的輔助函式
+# 解析 API JSON
 def parse_uniqlo_json(res_data):
     result = res_data.get('result', {})
     if not result:
         return None, None
         
-    # 如果回傳的是列表結構
     if 'items' in result and isinstance(result['items'], list) and len(result['items']) > 0:
         result = result['items'][0]
 
@@ -82,37 +82,51 @@ def parse_uniqlo_json(res_data):
 
     return name, price_val
 
-# 抓取 Uniqlo 官方 API
+# 三重強效抓取 (API 直連 -> API 搜尋 -> 網頁備援)
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip()
-    
-    # 嘗試兩種官方 API 結構 (1. 產品直連 2. 搜尋備援)
-    urls = []
-    if region == "tw":
-        urls.append(f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{clean_id}?priceCode=L2")
-        urls.append(f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={clean_id}&limit=1")
-        lang = "zh-TW,zh;q=0.9"
-    else:
-        urls.append(f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{clean_id}?priceCode=L2")
-        urls.append(f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={clean_id}&limit=1")
-        lang = "ja-JP,ja;q=0.9"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7' if region == 'tw' else 'ja-JP,ja;q=0.9,en-US;q=0.8'
+    }
 
-    for url in urls:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
-            'Accept': 'application/json',
-            'Accept-Language': lang
-        })
-
+    # 1. 嘗試 API 抓取
+    api_urls = [
+        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/{clean_id}?priceCode=L2",
+        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?query={clean_id}&limit=1"
+    ]
+    for url in api_urls:
         try:
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=4) as response:
                 if response.status == 200:
                     res_data = json.loads(response.read().decode('utf-8'))
                     name, price = parse_uniqlo_json(res_data)
-                    if name or price:
+                    if name and price:
                         return name, price
-        except Exception as e:
-            print(f"Fetch attempt failed ({region}-{item_id} -> {url}): {e}")
+        except Exception:
+            pass
+
+    # 2. 終極備援：直接解析網頁 HTML
+    try:
+        web_url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={clean_id}" if region == "tw" else f"https://www.uniqlo.com/jp/ja/products/{clean_id}"
+        req = urllib.request.Request(web_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=4) as response:
+            html = response.read().decode('utf-8')
+            
+            # 從 Open Graph meta 標籤抓取商品名稱
+            name_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
+            # 從內容抓取價格數字
+            price_match = re.search(r'NT\$\s*([\d,]+)', html) if region == "tw" else re.search(r'¥\s*([\d,]+)', html)
+
+            name = name_match.group(1).split('|')[0].strip() if name_match else None
+            price = float(price_match.group(1).replace(',', '')) if price_match else None
+
+            if name or price:
+                return name or f"Uniqlo 商品 ({clean_id})", price
+    except Exception as e:
+        print(f"Web scraper fallback failed ({region}-{item_id}): {e}")
 
     return None, None
 
