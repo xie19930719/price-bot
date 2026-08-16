@@ -2,7 +2,7 @@ import os
 import json
 import sqlite3
 import urllib.request
-import re
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -57,7 +57,7 @@ def get_jpy_rate():
     try:
         req = urllib.request.Request(
             "https://rate.bot.com.tw/xrt/flats/003/day",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            headers={"User-Agent": "Mozilla/5.0"},
         )
         with urllib.request.urlopen(req, timeout=5) as response:
             html = response.read().decode("utf-8", errors="ignore")
@@ -77,22 +77,15 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-def fetch_uniqlo_html(item_id, region="tw"):
+def fetch_uniqlo_api(item_id, region="tw"):
     clean_id = item_id.strip()
-    
-    # 修正：補上您提供的正確路由結構，並將貨號補齊 13 碼格式（前面補 0）
-    padded_id = clean_id.zfill(8)
-    product_code = f"u0000000{padded_id}"
-    
-    if region == "tw":
-        url = f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={product_code}"
-    else:
-        url = f"https://www.uniqlo.com/jp/ja_JP/product-detail.html?productCode={product_code}"
+    # 針對 UNIQLO 官方行動版 API 進行查詢（此 API 結構較穩定且直接回傳 JSON）
+    url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=5"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*|q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://www.uniqlo.com/{region}/"
     }
     
     try:
@@ -100,34 +93,55 @@ def fetch_uniqlo_html(item_id, region="tw"):
         with urllib.request.urlopen(req, timeout=8) as response:
             if response.status != 200:
                 return None, None
-            html_content = response.read().decode("utf-8", errors="ignore")
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
             
-        name = None
-        price_val = None
+        items = data.get("result", {}).get("items", [])
+        if not items:
+            return None, None
+            
+        # 比對貨號是否符合
+        target_item = None
+        for item in items:
+            p_code = str(item.get("productCode", ""))
+            i_code = str(item.get("id", ""))
+            if clean_id in p_code or clean_id in i_code or clean_id == p_code.lstrip('0'):
+                target_item = item
+                break
+                
+        if not target_item:
+            target_item = items[0]  # 若沒完全吻合則取第一筆
+            
+        name = target_item.get("name") or target_item.get("productName")
         
-        # 抓取 og:title 作為商品名稱
-        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html_content)
-        if title_match:
-            name = title_match.group(1).split('|')[0].strip()
-
-        # 從頁面中的價格標籤或 JSON 結構抓取數字
-        price_match = re.findall(r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', html_content)
-        if price_match:
-            prices = [float(p) for p in price_match if 100 < float(p) < 100000]
-            if prices:
-                price_val = min(prices)
-
-        if name or price_val is not None:
-            return name, price_val
-
+        # 抓取價格
+        price_val = None
+        if target_item.get("minPrice") is not None:
+            try:
+                price_val = float(target_item["minPrice"])
+            except:
+                pass
+                
+        if price_val is None and isinstance(target_item.get("prices"), dict):
+            for k in ("promo", "sale", "base", "original"):
+                val = target_item["prices"].get(k)
+                if isinstance(val, dict):
+                    val = val.get("value")
+                if val is not None:
+                    try:
+                        price_val = float(val)
+                        break
+                    except:
+                        pass
+                        
+        return name, price_val
     except Exception as e:
-        print(f"[HTML PARSE ERROR] {region}-{clean_id}: {e}")
+        print(f"[API ERROR] {region}-{clean_id}: {e}")
         
     return None, None
 
 def get_combined_info(item_id):
-    name_tw, price_tw = fetch_uniqlo_html(item_id, "tw")
-    name_jp, price_jp = fetch_uniqlo_html(item_id, "jp")
+    name_tw, price_tw = fetch_uniqlo_api(item_id, "tw")
+    name_jp, price_jp = fetch_uniqlo_api(item_id, "jp")
     
     display_tw = name_tw if name_tw else name_jp
     display_jp = name_jp if name_jp else name_tw
