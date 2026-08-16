@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # 🔒 請填入你的密鑰
 LINE_CHANNEL_SECRET = '2011128364'
-LINE_CHANNEL_ACCESS_TOKEN = '551273045ea1be5721345edf4196aec7'
+LINE_CHANNEL_ACCESS_TOKEN = 'ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU='
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
