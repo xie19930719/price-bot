@@ -36,11 +36,6 @@ def init_db():
 
 init_db()
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Accept': 'application/json'
-}
-
 # 動態抓取台日即時匯率
 def get_jpy_rate():
     try:
@@ -57,52 +52,89 @@ def get_jpy_rate():
         print(f"Fetch exchange rate error: {e}")
     return 0.22
 
-# 精確抓取 Uniqlo API 商品資訊 (兼顧多元 JSON 結構)
-def fetch_uniqlo_data(item_id, region="tw"):
+# 模擬行動裝置 API Header 以繞過雲端主機封鎖
+def get_app_headers(region="tw"):
+    return {
+        'User-Agent': 'UniqloApp/1.0.0 (iPhone; iOS 16.0; Scale/3.00)',
+        'Accept': 'application/json',
+        'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9',
+        'x-express-app-id': 'ecom-app-mobile'
+    }
+
+# 抓取 Uniqlo 官方 App 端點資料
+def fetch_uniqlo_app_data(item_id, region="tw"):
     formatted_id = item_id.zfill(6)
     
-    # 使用 UQ 的內部查詢 API 端點
+    # 使用包含完整品名的 API 端點
     if region == "tw":
-        url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
+        url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{formatted_id}/price"
+        fallback_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}"
     else:
-        url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
+        url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{formatted_id}/price"
+        fallback_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}"
+
+    headers = get_app_headers(region)
 
     try:
-        res = requests.get(url, headers=HEADERS, timeout=5)
+        # 第一嘗試：單品價格與資訊 API
+        res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            items = data.get('result', {}).get('items', [])
+            result = data.get('result', {})
+            name = result.get('name') or result.get('productName')
+            
+            # 解析價格
+            price_val = None
+            if 'promoPrice' in result and result['promoPrice']:
+                price_val = float(result['promoPrice'])
+            elif 'basePrice' in result and result['basePrice']:
+                price_val = float(result['basePrice'])
+            elif 'price' in result and result['price']:
+                price_val = float(result['price'])
+                
+            if name or price_val:
+                return name, price_val
+
+        # 第二嘗試：備用查詢 API
+        res_fb = requests.get(fallback_url, headers=headers, timeout=5)
+        if res_fb.status_code == 200:
+            data_fb = res_fb.json()
+            items = data_fb.get('result', {}).get('items', [])
             if items:
                 item = items[0]
                 name = item.get('name') or item.get('productName')
-                
-                # 提取價格
                 prices = item.get('prices', {})
                 price_val = None
-                for key in ['promo', 'base', 'original']:
-                    if key in prices and isinstance(prices[key], dict) and prices[key].get('value') is not None:
-                        price_val = float(prices[key]['value'])
-                        break
-                if price_val is None and 'minPrice' in item:
+                
+                if isinstance(prices, dict):
+                    for k in ['promo', 'base', 'original']:
+                        if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
+                            price_val = float(prices[k]['value'])
+                            break
+                elif 'minPrice' in item:
                     price_val = float(item['minPrice'])
-                    
-                if name and price_val:
-                    return name, price_val
+
+                return name, price_val
+
     except Exception as e:
-        print(f"Fetch API Exception ({region}-{item_id}): {e}")
+        print(f"API Error ({region}-{item_id}): {e}")
 
     return None, None
 
 # 整合台日兩地資料
 def get_combined_info(item_id):
-    name_tw, price_tw = fetch_uniqlo_data(item_id, "tw")
-    name_jp, price_jp = fetch_uniqlo_data(item_id, "jp")
+    name_tw, price_tw = fetch_uniqlo_app_data(item_id, "tw")
+    name_jp, price_jp = fetch_uniqlo_app_data(item_id, "jp")
+
+    # 若抓到的品名只有一邊有，用有的那一邊當主名稱
+    display_tw = name_tw if name_tw else name_jp
+    display_jp = name_jp if name_jp else name_tw
 
     brand = None
-    if name_tw or name_jp or price_tw is not None or price_jp is not None:
+    if price_tw is not None or price_jp is not None or display_tw is not None:
         brand = "UNIQLO"
 
-    return brand, name_tw, price_tw, name_jp, price_jp
+    return brand, display_tw, price_tw, display_jp, price_jp
 
 # 格式化日幣轉台幣顯示
 def format_jp_price(price_jp, rate):
