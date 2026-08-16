@@ -1,4 +1,4 @@
-flask
-line-bot-sdk
-requests
-gunicorn
+flask==2.3.3
+line-bot-sdk==2.4.2
+requests==2.31.0
+gunicorn==21.2.0
