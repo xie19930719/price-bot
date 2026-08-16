@@ -1,7 +1,6 @@
 import os
 import json
 import sqlite3
-import re
 import urllib.request
 import urllib.error
 from flask import Flask, request, abort
@@ -58,74 +57,42 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-def parse_html_for_data(html_str):
-    name = None
-    price = None
-
-    # 1. 嘗試從 __NEXT_DATA__ 抓取完整商品資訊
-    next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_str, re.DOTALL)
-    if next_data_match:
-        try:
-            json_data = json.loads(next_data_match.group(1))
-            # 遞迴或多路徑尋找 product 物件
-            page_props = json_data.get('props', {}).get('pageProps', {})
-            product = page_props.get('product') or page_props.get('initialState', {}).get('product', {})
-            if not product and 'dehydratedState' in page_props:
-                # 尋找 react-query 快取中的商品資料
-                queries = page_props['dehydratedState'].get('queries', [])
-                for q in queries:
-                    q_data = q.get('state', {}).get('data', {})
-                    if isinstance(q_data, dict):
-                        p_info = q_data.get('result', {} ) or q_data
-                        if 'name' in p_info or 'productName' in p_info:
-                            product = p_info
-                            break
-
-            if product:
-                name = product.get('name') or product.get('productName')
-                min_p = product.get('minPrice') or product.get('price')
-                if min_p is not None:
-                    price = float(min_p)
-        except Exception as e:
-            print(f"[JSON PARSE ERROR] {e}")
-
-    # 2. 備用方案：從網頁內嵌的 JSON 結構以正規表達式抓取 productName 與 price
-    if not name:
-        name_match = re.search(r'"productName"\s*:\s*"([^"]+)"', html_str) or re.search(r'"name"\s*:\s*"([^"]+)"', html_str)
-        if name_match:
-            name = name_match.group(1)
-
-    if not price:
-        price_match = re.search(r'"minPrice"\s*:\s*([0-9.]+)', html_str) or re.search(r'"price"\s*:\s*([0-9.]+)', html_str)
-        if price_match:
-            try:
-                price = float(price_match.group(1))
-            except ValueError:
-                pass
-
-    return name, price
-
 def fetch_uniqlo_official(item_id, region="tw"):
-    clean_id = item_id.strip().zfill(6)
+    clean_id = item_id.strip()
+    
+    # 透過 Uniqlo 公開搜尋 API（極少被擋，能直接用貨號查到品名與價格）
+    url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=1"
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'Accept': 'application/json, text/plain, */*'
     }
-
-    url = f"https://www.uniqlo.com/{region}/zh_TW/product-detail.html?productCode=u00000000{clean_id}" if region == "tw" else f"https://www.uniqlo.com/jp/ja/products/E{clean_id}-000"
 
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=6) as response:
+        with urllib.request.urlopen(req, timeout=5) as response:
             if response.status == 200:
-                content = response.read().decode('utf-8')
-                name, price = parse_html_for_data(content)
-                if name or price:
-                    return name, price
+                res_data = json.loads(response.read().decode('utf-8'))
+                result = res_data.get('result', {})
+                items = result.get('items', [])
+                if items and len(items) > 0:
+                    item = items[0]
+                    name = item.get('name') or item.get('productName')
+                    price_val = None
+                    
+                    # 抓取價格
+                    if 'minPrice' in item and item['minPrice'] is not None:
+                        price_val = float(item['minPrice'])
+                    elif 'prices' in item and isinstance(item['prices'], dict):
+                        prices = item['prices']
+                        for k in ['promo', 'base', 'original']:
+                            if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
+                                price_val = float(prices[k]['value'])
+                                break
+                    
+                    return name, price_val
     except Exception as e:
-        print(f"[FETCH ERROR] {region}-{clean_id}: {e}")
+        print(f"[SEARCH API ERROR] {region}-{clean_id}: {e}")
 
     return None, None
 
