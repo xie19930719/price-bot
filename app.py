@@ -58,60 +58,89 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-# 剖析 JSON
-def parse_uniqlo_json(res_data):
-    result = res_data.get('result', {})
-    if not result:
-        return None, None
-        
-    if 'items' in result and isinstance(result['items'], list) and len(result['items']) > 0:
-        result = result['items'][0]
+def parse_html_for_data(html_str):
+    name = None
+    price = None
 
-    name = result.get('name') or result.get('productName')
-    price_val = None
+    # 1. 嘗試尋找 __NEXT_DATA__ JSON 區塊
+    next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_str, re.DOTALL)
+    if next_data_match:
+        try:
+            json_data = json.loads(next_data_match.group(1))
+            # 嘗試深層解析
+            product = json_data.get('props', {}).get('pageProps', {}).get('product', {})
+            if product:
+                name = product.get('name') or product.get('productName')
+                min_p = product.get('minPrice')
+                if min_p is not None:
+                    price = float(min_p)
+        except Exception:
+            pass
 
-    if 'minPrice' in result and result['minPrice'] is not None:
-        price_val = float(result['minPrice'])
-    elif 'prices' in result and isinstance(result['prices'], dict):
-        prices = result['prices']
-        for k in ['promo', 'base', 'original', 'sale']:
-            if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
-                price_val = float(prices[k]['value'])
-                break
+    # 2. 如果沒抓到，用正則表達式備用匹配標題與價格
+    if not name:
+        title_match = re.search(r'<title>(.*?)</title>', html_str, re.IGNORECASE)
+        if title_match:
+            raw_title = title_match.group(1)
+            name = raw_title.split('|')[0].replace('UNIQLO', '').strip()
 
-    return name, price_val
+    if not price:
+        # 匹配 ¥ 或 NT$ 數字
+        price_match = re.search(r'(?:NT\$|NT\$\s*|￥|¥)\s*([0-9,]+)', html_str)
+        if price_match:
+            try:
+                price = float(price_match.group(1).replace(',', ''))
+            except ValueError:
+                pass
 
-# 透過 Proxy 代理繞過 IP 封鎖
+    return name, price
+
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip().zfill(6)
     
-    # 原生 Endpoint
-    target_url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/E{clean_id}-000?priceCode=L2"
-    
-    # 建立多重請求來源 (直連 -> 代理 1 -> 代理 2)
-    urls = [
-        target_url,
-        f"https://corsproxy.io/?{urllib.parse.quote(target_url)}",
-        f"https://api.allorigins.win/raw?url={urllib.parse.quote(target_url)}"
-    ]
-
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9',
+        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none'
     }
+
+    # 同時測試 HTML 頁面 與 API
+    urls = []
+    if region == "tw":
+        urls.append(f"https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode=u00000000{clean_id}")
+        urls.append(f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/E{clean_id}-000?priceCode=L2")
+    else:
+        urls.append(f"https://www.uniqlo.com/jp/ja/products/E{clean_id}-000")
+        urls.append(f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/E{clean_id}-000?priceCode=L2")
 
     for url in urls:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as response:
                 if response.status == 200:
-                    res_text = response.read().decode('utf-8')
-                    res_data = json.loads(res_text)
-                    name, price = parse_uniqlo_json(res_data)
-                    if name or price:
-                        return name, price
+                    content = response.read().decode('utf-8')
+                    # 如果是 JSON
+                    if content.startswith('{'):
+                        res_data = json.loads(content)
+                        res = res_data.get('result', {})
+                        if 'items' in res and len(res['items']) > 0:
+                            res = res['items'][0]
+                        n = res.get('name')
+                        p = res.get('minPrice')
+                        if n or p:
+                            return n, float(p) if p else None
+                    else:
+                        # 如果是 HTML 頁面
+                        n, p = parse_html_for_data(content)
+                        if n or p:
+                            return n, p
         except Exception as e:
-            print(f"[FETCH FAILED] {url} -> {e}")
+            print(f"[FETCH ERROR] {url}: {e}")
 
     return None, None
 
