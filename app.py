@@ -58,15 +58,16 @@ def get_jpy_rate():
         print(f"Fetch exchange rate error: {e}")
     return 0.22
 
-# 直接請求 Uniqlo 官方 API 節點 (使用原生 urllib 避免 Cloudflare 封鎖)
+# 直接請求 Uniqlo 官方 API 節點 (精確商品 Endpoint)
 def fetch_uniqlo_official(item_id, region="tw"):
-    formatted_id = item_id.zfill(6)
+    # 自動去除空白並補足 6 位數
+    clean_id = item_id.strip().zfill(6)
     
     if region == "tw":
-        url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
+        url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/E{clean_id}-000?priceCode=L2"
         lang = "zh-TW,zh;q=0.9"
     else:
-        url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
+        url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/E{clean_id}-000?priceCode=L2"
         lang = "ja-JP,ja;q=0.9"
 
     req = urllib.request.Request(url, headers={
@@ -79,22 +80,23 @@ def fetch_uniqlo_official(item_id, region="tw"):
         with urllib.request.urlopen(req, timeout=5) as response:
             if response.status == 200:
                 res_data = json.loads(response.read().decode('utf-8'))
-                items = res_data.get('result', {}).get('items', [])
-                if items:
-                    item = items[0]
-                    name = item.get('name') or item.get('productName')
+                result = res_data.get('result', {})
+                
+                if result:
+                    # 抓取商品名稱
+                    name = result.get('name') or result.get('productName')
                     
-                    # 抓價格
+                    # 抓取價格
                     price_val = None
-                    prices = item.get('prices', {})
-                    if isinstance(prices, dict):
+                    if 'minPrice' in result and result['minPrice'] is not None:
+                        price_val = float(result['minPrice'])
+                    elif 'prices' in result and isinstance(result['prices'], dict):
+                        prices = result['prices']
                         for k in ['promo', 'base', 'original']:
                             if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
                                 price_val = float(prices[k]['value'])
                                 break
-                    if price_val is None and 'minPrice' in item:
-                        price_val = float(item['minPrice'])
-                        
+                                
                     return name, price_val
     except Exception as e:
         print(f"Fetch error ({region}-{item_id}): {e}")
@@ -124,7 +126,7 @@ def format_jp_price(price_jp, rate):
 
 @app.route("/")
 def home():
-    return "H電商台日價格追蹤 Bot 運作中！", 200
+    return "電商台日價格追蹤 Bot 運作中！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
