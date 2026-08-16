@@ -58,7 +58,7 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-# 深度剖析 Uniqlo JSON 結構的輔助函式
+# 剖析 JSON
 def parse_uniqlo_json(res_data):
     result = res_data.get('result', {})
     if not result:
@@ -67,11 +67,9 @@ def parse_uniqlo_json(res_data):
     if 'items' in result and isinstance(result['items'], list) and len(result['items']) > 0:
         result = result['items'][0]
 
-    # 取出商品名稱
     name = result.get('name') or result.get('productName')
     price_val = None
 
-    # 多重價格結構解析
     if 'minPrice' in result and result['minPrice'] is not None:
         price_val = float(result['minPrice'])
     elif 'prices' in result and isinstance(result['prices'], dict):
@@ -80,42 +78,40 @@ def parse_uniqlo_json(res_data):
             if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
                 price_val = float(prices[k]['value'])
                 break
-    elif 'l2Goods' in result and isinstance(result['l2Goods'], list) and len(result['l2Goods']) > 0:
-        # 從規格列表提取第一個有標價的商品
-        for g in result['l2Goods']:
-            if 'price' in g and g['price']:
-                price_val = float(g['price'])
-                break
 
     return name, price_val
 
+# 透過 Proxy 代理繞過 IP 封鎖
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip().zfill(6)
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9'
-    }
-
-    # 多重 Endpoints 輪詢測試 (包含全碼 E{貨號}-000 與短碼)
+    # 原生 Endpoint
+    target_url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/E{clean_id}-000?priceCode=L2"
+    
+    # 建立多重請求來源 (直連 -> 代理 1 -> 代理 2)
     urls = [
-        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/E{clean_id}-000?priceCode=L2",
-        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/{clean_id}?priceCode=L2",
-        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?query={clean_id}&limit=1"
+        target_url,
+        f"https://corsproxy.io/?{urllib.parse.quote(target_url)}",
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(target_url)}"
     ]
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*'
+    }
 
     for url in urls:
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=4) as response:
+            with urllib.request.urlopen(req, timeout=5) as response:
                 if response.status == 200:
-                    res_data = json.loads(response.read().decode('utf-8'))
+                    res_text = response.read().decode('utf-8')
+                    res_data = json.loads(res_text)
                     name, price = parse_uniqlo_json(res_data)
-                    if name and price:
+                    if name or price:
                         return name, price
         except Exception as e:
-            print(f"[FETCH ERROR] {region}-{clean_id} via {url}: {e}")
+            print(f"[FETCH FAILED] {url} -> {e}")
 
     return None, None
 
@@ -142,7 +138,6 @@ def format_jp_price(price_jp, rate):
 def home():
     return "電商台日價格追蹤 Bot 運作中！", 200
 
-# 測試 Endpoint
 @app.route("/test/<item_id>")
 def test_item(item_id):
     brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
