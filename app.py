@@ -7,7 +7,10 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage, 
+    QuickReply, QuickReplyButton, MessageAction
+)
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
@@ -100,7 +103,6 @@ def format_jp_price_with_twd(jp_price_str):
         return f"￥ {jp_price_str}"
 
 def check_and_update_prices():
-    """每日定時自動檢查所有追蹤清單的價格"""
     print("⏳ 開始執行每日自動價格檢查...")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -119,26 +121,22 @@ def check_and_update_prices():
                 changes.append(f"🇯🇵 日本價格變動：￥ {old_jp} ➔ ￥ {new_jp}")
             
             if changes:
-                # 更新資料庫
                 cursor.execute(
                     "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE id = ?",
                     (new_name, new_tw, new_jp, item_id)
                 )
                 conn.commit()
                 
-                # 推播通知給使用者
                 change_text = "\n".join(changes)
                 push_msg = f"🔔 【UQ 價格變動通知】\n📦 {new_name}\n\n{change_text}\n\n🔗 {url}"
                 try:
                     line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
-                    print(f"已發送價格變動通知給 {user_id}")
                 except Exception as e:
                     print(f"Push message error: {e}")
                     
     conn.close()
     print("✅ 每日價格檢查完畢。")
 
-# 設定排程器：每天中午 12:00 執行
 scheduler = BackgroundScheduler(timezone=TAIWAN_TZ)
 scheduler.add_job(func=check_and_update_prices, trigger="cron", hour=12, minute=0)
 scheduler.start()
@@ -171,12 +169,32 @@ def handle_message(event):
         
         if not rows:
             reply = "📋 目前沒有追蹤任何商品。"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         else:
-            reply = "📋 【你的追蹤清單】\n(輸入「-數字」可刪除該項，例如 -2)\n"
+            reply = "📋 【你的追蹤清單】\n點擊下方按鈕可直接刪除對應商品：\n"
             for idx, row in enumerate(rows, 1):
                 item_id, name, tw_p, jp_p, url = row
                 jp_formatted = format_jp_price_with_twd(jp_p)
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}\n   🔗 {url}\n"
+            
+            # 動態產生刪除按鈕 (Quick Reply)
+            quick_reply_buttons = []
+            for idx in range(1, len(rows) + 1):
+                quick_reply_buttons.append(
+                    QuickReplyButton(
+                        action=MessageAction(label=f"刪除第 {idx} 項", text=f"-{idx}")
+                    )
+                )
+            # 另外加上一個「查看清單」或其它快捷按鈕
+            quick_reply_buttons.append(
+                QuickReplyButton(action=MessageAction(label="📋 重新整理清單", text="清單"))
+            )
+            
+            quick_reply = QuickReply(items=quick_reply_buttons)
+            line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(text=reply, quick_reply=quick_reply)
+            )
                 
     elif re.match(r"^-\d+$", msg):
         target_idx = int(msg.replace("-", ""))
@@ -189,10 +207,12 @@ def handle_message(event):
             real_db_id = rows[target_idx - 1][0]
             cursor.execute("DELETE FROM tracked_items WHERE id = ?", (real_db_id,))
             conn.commit()
-            reply = f"🗑️ 已成功刪除清單中的第 {target_idx} 項商品。"
+            reply = f"🗑️ 已成功刪除清單中的第 {target_idx} 項商品。\n請輸入「清單」查看最新狀態。"
         else:
-            reply = "⚠️ 找不到該編號的商品，請先輸入「清單」確認正確編號。"
+            reply = "⚠️ 找不到該編號的商品。"
         conn.close()
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         
     elif "goodjack.tw" in msg:
         name, tw_p, jp_p = fetch_product_details(msg)
@@ -208,7 +228,7 @@ def handle_message(event):
                     (user_id, msg, name, tw_p, jp_p)
                 )
                 conn.commit()
-                status_msg = "✅ 已成功加入追蹤清單！每日中午 12 點將自動幫您對比價格變動。"
+                status_msg = "✅ 已成功加入追蹤清單！"
             else:
                 cursor.execute(
                     "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE user_id = ? AND url = ?",
@@ -222,10 +242,24 @@ def handle_message(event):
             reply = f"{status_msg}\n\n📦 商品名稱：{name}\n🇹🇼 台灣售價：NT$ {tw_p}\n🇯🇵 日本售價：{jp_formatted}"
         else:
             reply = "⚠️ 無法抓取該網址資料，請檢查網址是否正確。"
+            
+        # 附上快捷按鈕讓使用者可以快速查看清單
+        quick_reply = QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="📋 查看清單", text="清單"))
+        ])
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text=reply, quick_reply=quick_reply)
+        )
     else:
-        reply = "💡 請傳送 UQ 網址加入追蹤，輸入「清單」查看全部，或輸入「-數字」刪除指定項目。"
-        
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        reply = "💡 請傳送 UQ 網址加入追蹤，或輸入「清單」查看全部。"
+        quick_reply = QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="📋 查看清單", text="清單"))
+        ])
+        line_bot_api.reply_message(
+            event.reply_token, 
+            TextSendMessage(text=reply, quick_reply=quick_reply)
+        )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
