@@ -1,8 +1,6 @@
 import os
-import re
 import sqlite3
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -39,10 +37,11 @@ def init_db():
 init_db()
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
 }
 
-# 動態抓取日幣對台幣匯率（備用為 0.22）
+# 抓取即時匯率
 def get_jpy_rate():
     try:
         res = requests.get("https://rate.bot.com.tw/xrt/flats/003/day", timeout=3)
@@ -51,7 +50,6 @@ def get_jpy_rate():
             for line in lines:
                 if "JPY" in line:
                     parts = line.split(',')
-                    # 抓取現金賣出或即期賣出價
                     rate = float(parts[12]) if len(parts) > 12 else float(parts[2])
                     if rate > 0:
                         return rate
@@ -59,54 +57,49 @@ def get_jpy_rate():
         print(f"Fetch exchange rate error: {e}")
     return 0.22
 
-# 抓取 uq.goodjack.tw 上的台灣或日本商品頁面
-def fetch_goodjack_info(item_id, region="tw"):
+# 呼叫 Goodjack JSON API 抓取商品詳細資料
+def fetch_goodjack_api(item_id, region="tw"):
     if region == "tw":
-        url = f"https://uq.goodjack.tw/item/{item_id}"
+        url = f"https://uq.goodjack.tw/api/v1/items/{item_id}"
     else:
-        url = f"https://uq.goodjack.tw/japan/item/{item_id}"
+        url = f"https://uq.goodjack.tw/api/v1/japan/items/{item_id}"
 
     try:
         res = requests.get(url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
+            data = res.json()
+            # 支援兩種 common JSON 欄位結構
+            name = data.get('name') or data.get('title')
             
-            title_tag = soup.find('h1') or soup.find('title')
-            name = None
-            if title_tag:
-                name_text = title_tag.text.strip()
-                name = re.sub(r'\|.*', '', name_text).strip()
-            
-            price_val = None
-            text_content = soup.get_text()
-            
-            if region == "tw":
-                match = re.search(r'NT\$?\s*([0-9,]+)', text_content)
-            else:
-                match = re.search(r'¥\s*([0-9,]+)', text_content)
+            # 抓取最新價格
+            price = None
+            if 'price' in data and data['price'] is not None:
+                price = float(data['price'])
+            elif 'prices' in data and isinstance(data['prices'], list) and len(data['prices']) > 0:
+                price = float(data['prices'][0].get('price'))
+            elif 'min_price' in data:
+                price = float(data['min_price'])
 
-            if match:
-                price_val = float(match.group(1).replace(',', ''))
-
-            if name and price_val:
-                return name, price_val
+            if name:
+                return name, price
     except Exception as e:
-        print(f"Goodjack Fetch Error ({region}-{item_id}): {e}")
+        print(f"Goodjack API Error ({region}-{item_id}): {e}")
 
     return None, None
 
-# 整合查詢：同時搜尋台日資料
+# 整合台日資料查詢
 def get_combined_info(item_id):
-    name_tw, price_tw = fetch_goodjack_info(item_id, "tw")
-    name_jp, price_jp = fetch_goodjack_info(item_id, "jp")
+    formatted_id = item_id.zfill(6)
+    name_tw, price_tw = fetch_goodjack_api(formatted_id, "tw")
+    name_jp, price_jp = fetch_goodjack_api(formatted_id, "jp")
 
     brand = None
-    if price_tw is not None or price_jp is not None:
+    if name_tw or name_jp or price_tw is not None or price_jp is not None:
         brand = "UNIQLO/GU"
 
     return brand, name_tw, price_tw, name_jp, price_jp
 
-# 格式化日幣轉台幣文字
+# 格式化日幣轉台幣顯示
 def format_jp_price(price_jp, rate):
     if price_jp is None:
         return "🇯🇵 日本：未發售 / 無資料"
@@ -115,7 +108,7 @@ def format_jp_price(price_jp, rate):
 
 @app.route("/")
 def home():
-    return "H電商台日價格追蹤 Bot (Goodjack版) 運作中！", 200
+    return "H電商台日價格追蹤 Bot (Goodjack API版) 運作中！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -239,7 +232,7 @@ def handle_message(event):
             reply = "💡 請使用正確格式：`-貨號`（例如 `-484808`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    # 指令：純數字貨號 (純查價，不加入追蹤)
+    # 指令：純數字貨號 (單純查價)
     elif user_msg.isdigit():
         item_id = user_msg
         brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
