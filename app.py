@@ -24,22 +24,32 @@ def fetch_product_details(url):
             
         soup = BeautifulSoup(html_content, "html.parser")
         
-        # 抓取商品名稱
+        # 1. 抓取商品名稱
         name_tag = soup.find("h1")
         name = name_tag.text.strip() if name_tag else "未知商品"
         
-        # 取得網頁內文並用正規表達式撈取台幣與日幣價格
-        text = soup.get_text()
         tw_price = "無資料"
         jp_price = "無資料"
+        text = soup.get_text()
         
+        # 2. 抓取台灣當前價格
         tw_match = re.search(r"NT\$\s*([\d,]+)", text)
-        jp_match = re.search(r"￥\s*([\d,]+)", text)
-        
         if tw_match:
             tw_price = tw_match.group(1)
-        if jp_match:
-            jp_price = jp_match.group(1)
+            
+        # 3. 精準抓取日本當前價格（鎖定「當前價格」區塊，避開歷史高低價）
+        current_price_box = soup.find(string=re.compile(r"當前價格"))
+        if current_price_box:
+            parent_text = current_price_box.find_parent().get_text()
+            jp_match = re.search(r"[￥¥]\s*([\d,]+)", parent_text)
+            if jp_match:
+                jp_price = jp_match.group(1)
+        
+        # 若未找到專屬區塊，改用備用方案
+        if jp_price == "無資料":
+            jp_match_all = re.search(r"[￥¥]\s*([\d,]+)", text)
+            if jp_match_all:
+                jp_price = jp_match_all.group(1)
             
         return name, tw_price, jp_price
     except Exception as e:
