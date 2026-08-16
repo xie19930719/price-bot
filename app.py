@@ -2,17 +2,20 @@ import os
 import re
 import sqlite3
 import urllib.request
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "551273045ea1be5721345edf4196aec7")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU=")
 DB_PATH = "tracker.db"
+TAIWAN_TZ = timezone(timedelta(hours=8))
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -36,21 +39,19 @@ def init_db():
 init_db()
 
 def get_jpy_to_twd_rate():
-    """簡單取得日幣換台幣匯率，若失敗則預設 0.21"""
     try:
-        url = "https://rate.bot.com.tw/xrt/flcsv/0.5/day" # 臺灣銀行牌告匯率
+        url = "https://rate.bot.com.tw/xrt/flcsv/0.5/day"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=3) as res:
             lines = res.read().decode("utf-8").split("\n")
             for line in lines:
                 if "JPY" in line:
                     parts = line.split(",")
-                    # 賣出匯率通常在特定欄位，取現鈔賣出或即期賣出
-                    rate = float(parts[12]) # 視臺銀 CSV 格式而定
+                    rate = float(parts[12])
                     return rate
     except Exception:
         pass
-    return 0.21 # 預設參考匯率
+    return 0.21
 
 def fetch_product_details(url):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -90,7 +91,6 @@ def fetch_product_details(url):
         return None, None, None
 
 def format_jp_price_with_twd(jp_price_str):
-    """計算日幣換算台幣金額"""
     try:
         clean_val = float(jp_price_str.replace(",", ""))
         rate = get_jpy_to_twd_rate()
@@ -99,9 +99,53 @@ def format_jp_price_with_twd(jp_price_str):
     except Exception:
         return f"￥ {jp_price_str}"
 
+def check_and_update_prices():
+    """每日定時自動檢查所有追蹤清單的價格"""
+    print("⏳ 開始執行每日自動價格檢查...")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, user_id, url, name, tw_price, jp_price FROM tracked_items")
+    rows = cursor.fetchall()
+    
+    for row in rows:
+        item_id, user_id, url, old_name, old_tw, old_jp = row
+        new_name, new_tw, new_jp = fetch_product_details(url)
+        
+        if new_name and new_tw != "無資料":
+            changes = []
+            if new_tw != old_tw:
+                changes.append(f"🇹🇼 台灣價格變動：NT$ {old_tw} ➔ NT$ {new_tw}")
+            if new_jp != old_jp:
+                changes.append(f"🇯🇵 日本價格變動：￥ {old_jp} ➔ ￥ {new_jp}")
+            
+            if changes:
+                # 更新資料庫
+                cursor.execute(
+                    "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE id = ?",
+                    (new_name, new_tw, new_jp, item_id)
+                )
+                conn.commit()
+                
+                # 推播通知給使用者
+                change_text = "\n".join(changes)
+                push_msg = f"🔔 【UQ 價格變動通知】\n📦 {new_name}\n\n{change_text}\n\n🔗 {url}"
+                try:
+                    line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
+                    print(f"已發送價格變動通知給 {user_id}")
+                except Exception as e:
+                    print(f"Push message error: {e}")
+                    
+    conn.close()
+    print("✅ 每日價格檢查完畢。")
+
+# 設定排程器：每天中午 12:00 執行
+scheduler = BackgroundScheduler(timezone=TAIWAN_TZ)
+scheduler.add_job(func=check_and_update_prices, trigger="cron", hour=12, minute=0)
+scheduler.start()
+
 @app.route("/")
 def home():
-    return "UQ 價格追蹤 Bot 運作中！", 200
+    return "UQ 價格追蹤 Bot 與定時排程運作中！", 200
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -135,7 +179,6 @@ def handle_message(event):
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}\n   🔗 {url}\n"
                 
     elif re.match(r"^-\d+$", msg):
-        # 處理刪除指令，例如 "-2"
         target_idx = int(msg.replace("-", ""))
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -165,7 +208,7 @@ def handle_message(event):
                     (user_id, msg, name, tw_p, jp_p)
                 )
                 conn.commit()
-                status_msg = "✅ 已成功加入追蹤清單！"
+                status_msg = "✅ 已成功加入追蹤清單！每日中午 12 點將自動幫您對比價格變動。"
             else:
                 cursor.execute(
                     "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE user_id = ? AND url = ?",
