@@ -10,25 +10,20 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# Token / Secret 請設定在環境變數，不要寫死在程式碼
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+# Token / Secret 請設定在環境變數，或直接填在此處
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "551273045ea1be5721345edf4196aec7")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU=")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 DB_PATH = os.getenv("DB_PATH", "tracker.db")
 TAIWAN_TZ = timezone(timedelta(hours=8))
 
-if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
-    print("[WARNING] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 尚未設定。")
-
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
-
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = get_db()
@@ -60,9 +55,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 init_db()
-
 
 def get_jpy_rate():
     try:
@@ -88,7 +81,6 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
-
 def fetch_uniqlo_official(item_id, region="tw"):
     clean_id = item_id.strip()
     url = f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?q={clean_id}&limit=10"
@@ -106,7 +98,6 @@ def fetch_uniqlo_official(item_id, region="tw"):
         if not isinstance(items, list) or not items:
             return None, None
 
-        # 優先找真正等於貨號的結果，找不到才退回第一筆
         item = None
         for candidate in items:
             ids = [candidate.get(k) for k in ("id", "productCode", "itemCode", "code", "sku")]
@@ -139,7 +130,6 @@ def fetch_uniqlo_official(item_id, region="tw"):
         print(f"[SEARCH API ERROR] {region}-{clean_id}: {e}")
     return None, None
 
-
 def get_combined_info(item_id):
     name_tw, price_tw = fetch_uniqlo_official(item_id, "tw")
     name_jp, price_jp = fetch_uniqlo_official(item_id, "jp")
@@ -148,16 +138,13 @@ def get_combined_info(item_id):
     brand = "UNIQLO" if any(x is not None for x in (price_tw, price_jp, display_tw, display_jp)) else None
     return brand, display_tw, price_tw, display_jp, price_jp
 
-
 def format_jp_price(price_jp, rate):
     if price_jp is None:
         return "🇯🇵 日本：未發售 / 無資料"
     return f"🇯🇵 日本：¥ {int(price_jp):,} (約 NT$ {round(price_jp * rate):,})"
 
-
 def now_tw():
     return datetime.now(TAIWAN_TZ).isoformat(timespec="seconds")
-
 
 def get_previous_price(conn, item_id, region):
     row = conn.execute(
@@ -166,7 +153,6 @@ def get_previous_price(conn, item_id, region):
     ).fetchone()
     return float(row["price"]) if row else None
 
-
 def save_price_history(conn, item_id, region, price):
     if price is not None:
         conn.execute(
@@ -174,92 +160,14 @@ def save_price_history(conn, item_id, region, price):
             (item_id, region, float(price), now_tw()),
         )
 
-
-def build_price_change_message(item_id, name_tw, name_jp, old_tw, new_tw, old_jp, new_jp, rate):
-    lines = ["🔔 UNIQLO 降價通知", f"🏷️ 貨號：{item_id}"]
-    name = name_tw or name_jp
-    if name:
-        lines.append(f"商品：{name}")
-    lines.append("")
-    if old_tw is not None and new_tw is not None and new_tw < old_tw:
-        lines.append(f"🇹🇼 台灣：NT$ {int(old_tw):,} → NT$ {int(new_tw):,}（降 NT$ {int(old_tw-new_tw):,}）")
-    if old_jp is not None and new_jp is not None and new_jp < old_jp:
-        lines.append(f"🇯🇵 日本：¥ {int(old_jp):,} → ¥ {int(new_jp):,}（降 ¥ {int(old_jp-new_jp):,}，約 NT$ {round(new_jp*rate):,}）")
-    lines.append("")
-    lines.append("💡 任一地區價格下降，我就會通知你。")
-    return "\n".join(lines)
-
-
-def check_all_prices():
-    conn = get_db()
-    rows = conn.execute("SELECT DISTINCT item_id FROM tracked_items_v2 ORDER BY item_id").fetchall()
-    if not rows:
-        conn.close()
-        return {"checked_items": 0, "notifications": 0, "message": "目前沒有追蹤商品。"}
-
-    rate = get_jpy_rate()
-    checked_items = 0
-    notifications = 0
-
-    for row in rows:
-        item_id = row["item_id"]
-        try:
-            brand, name_tw, price_tw, name_jp, price_jp = get_combined_info(item_id)
-            if not brand:
-                print(f"[CHECK] {item_id}: 找不到商品")
-                continue
-
-            old_tw = get_previous_price(conn, item_id, "tw")
-            old_jp = get_previous_price(conn, item_id, "jp")
-            dropped_tw = old_tw is not None and price_tw is not None and price_tw < old_tw
-            dropped_jp = old_jp is not None and price_jp is not None and price_jp < old_jp
-
-            save_price_history(conn, item_id, "tw", price_tw)
-            save_price_history(conn, item_id, "jp", price_jp)
-            conn.execute(
-                "UPDATE tracked_items_v2 SET price_tw=COALESCE(?,price_tw), price_jp=COALESCE(?,price_jp), name_tw=COALESCE(?,name_tw), name_jp=COALESCE(?,name_jp) WHERE item_id=?",
-                (price_tw, price_jp, name_tw, name_jp, item_id),
-            )
-
-            if dropped_tw or dropped_jp:
-                users = conn.execute("SELECT DISTINCT user_id FROM tracked_items_v2 WHERE item_id=?", (item_id,)).fetchall()
-                message = build_price_change_message(item_id, name_tw, name_jp, old_tw, price_tw, old_jp, price_jp, rate)
-                if line_bot_api:
-                    for user in users:
-                        try:
-                            line_bot_api.push_message(user["user_id"], TextSendMessage(text=message))
-                            notifications += 1
-                        except Exception as e:
-                            print(f"[PUSH ERROR] item={item_id}, user={user['user_id']}: {e}")
-
-            conn.commit()
-            checked_items += 1
-            print(f"[CHECK] {item_id}: TW={price_tw}, JP={price_jp}, oldTW={old_tw}, oldJP={old_jp}")
-        except Exception as e:
-            print(f"[CHECK ERROR] {item_id}: {e}")
-
-    conn.close()
-    return {"checked_items": checked_items, "notifications": notifications, "message": "價格檢查完成。"}
-
-
 @app.route("/")
 def home():
     return "電商台日價格追蹤 Bot 運作中！", 200
-
 
 @app.route("/test/<item_id>")
 def test_item(item_id):
     brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
     return {"item_id": item_id, "brand": brand, "name_tw": n_tw, "price_tw": p_tw, "name_jp": n_jp, "price_jp": p_jp}, 200
-
-
-@app.route("/cron/check", methods=["GET", "POST"])
-def cron_check():
-    # 外部排程可呼叫此網址；設定 CRON_SECRET 後需帶 X-Cron-Secret header
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
-        abort(403)
-    return check_all_prices(), 200
-
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -275,7 +183,6 @@ def callback():
         print(f"[WEBHOOK ERROR] {e}")
         abort(500)
     return "OK", 200
-
 
 if handler:
     @handler.add(MessageEvent, message=TextMessage)
@@ -357,7 +264,6 @@ if handler:
                 print(f"[REPLY ERROR] {reply_error}")
         finally:
             conn.close()
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
