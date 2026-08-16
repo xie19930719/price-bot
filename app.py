@@ -16,7 +16,6 @@ LINE_CHANNEL_ACCESS_TOKEN = 'ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhp
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 初始化 SQLite 資料庫
 def init_db():
     conn = sqlite3.connect('tracker.db')
     cursor = conn.cursor()
@@ -37,55 +36,75 @@ def init_db():
 
 init_db()
 
-# 通用 API 請求函式（帶上完整的瀏覽器 Headers 避免被 API 反爬蟲擋掉）
-def fetch_api(url, referer_url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': referer_url
-    }
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*'
+}
+
+# 1. 透過搜尋 API 將 6 位數貨號轉為內部 Product Code
+def search_product_code(query, region="tw", brand="uniqlo"):
+    domain = "uniqlo.com" if brand == "uniqlo" else "gu-global.com"
+    url = f"https://www.{domain}/{region}/api/commerce/v5/{region}/products?query={query}&limit=1"
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=HEADERS, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            if data.get('code') == '200' and 'result' in data:
-                items = data['result'].get('items', [])
-                if items:
-                    name = items[0].get('name')
-                    price_val = items[0].get('prices', {}).get('base', {}).get('value')
-                    if price_val is not None:
-                        return name, float(price_val)
+            items = data.get('result', {}).get('items', [])
+            if items:
+                return items[0].get('productId') or items[0].get('productCode')
     except Exception as e:
-        print(f"Fetch API error for {url}: {e}")
+        print(f"Search error ({brand}-{region}): {e}")
+    return None
+
+# 2. 抓取具體商品的名稱與價格
+def fetch_product_details(product_code, region="tw", brand="uniqlo"):
+    if not product_code:
+        return None, None
+    domain = "uniqlo.com" if brand == "uniqlo" else "gu-global.com"
+    url = f"https://www.{domain}/{region}/api/commerce/v5/{region}/products/{product_code}?priceGroup=official&expand=prices"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            result = data.get('result', {})
+            items = result.get('items', [result.get('product', {})]) if 'items' in result or 'product' in result else []
+            for item in items:
+                name = item.get('name')
+                prices = item.get('prices', {})
+                price_val = None
+                for key in ['base', 'promo', 'original']:
+                    if key in prices and prices[key].get('value') is not None:
+                        price_val = prices[key]['value']
+                        break
+                if name and price_val is not None:
+                    return name, float(price_val)
+    except Exception as e:
+        print(f"Fetch details error ({brand}-{region}): {e}")
     return None, None
 
-# 整合查詢：同時搜尋 Uniqlo / GU 的台灣與日本資料
+# 跨國與跨品牌整合查詢
 def get_combined_info(item_id):
     brand = None
     name_tw, price_tw = None, None
     name_jp, price_jp = None, None
 
-    # 格式化貨號 (確保 6 位數字)
-    formatted_id = item_id.zfill(6)
+    # 搜尋 Uniqlo
+    code_tw = search_product_code(item_id, "tw", "uniqlo") or item_id
+    code_jp = search_product_code(item_id, "jp", "uniqlo") or item_id
 
-    # 1. 搜尋 Uniqlo (台灣 & 日本)
-    tw_u_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{formatted_id}?priceGroup=official"
-    jp_u_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{formatted_id}?priceGroup=official"
-    
-    name_tw, price_tw = fetch_api(tw_u_url, "https://www.uniqlo.com/tw/")
-    name_jp, price_jp = fetch_api(jp_u_url, "https://www.uniqlo.com/jp/")
+    name_tw, price_tw = fetch_product_details(code_tw, "tw", "uniqlo")
+    name_jp, price_jp = fetch_product_details(code_jp, "jp", "uniqlo")
 
     if price_tw is not None or price_jp is not None:
         brand = "UNIQLO"
     else:
-        # 2. 若 Uniqlo 沒找到，搜尋 GU (台灣 & 日本)
-        tw_g_url = f"https://www.gu-global.com/tw/api/commerce/v5/tw/products/{formatted_id}?priceGroup=official"
-        jp_g_url = f"https://www.gu-global.com/jp/api/commerce/v5/jp/products/{formatted_id}?priceGroup=official"
-        
-        name_tw, price_tw = fetch_api(tw_g_url, "https://www.gu-global.com/tw/")
-        name_jp, price_jp = fetch_api(jp_g_url, "https://www.gu-global.com/jp/")
-        
+        # 搜尋 GU
+        code_tw_g = search_product_code(item_id, "tw", "gu") or item_id
+        code_jp_g = search_product_code(item_id, "jp", "gu") or item_id
+
+        name_tw, price_tw = fetch_product_details(code_tw_g, "tw", "gu")
+        name_jp, price_jp = fetch_product_details(code_jp_g, "jp", "gu")
+
         if price_tw is not None or price_jp is not None:
             brand = "GU"
 
@@ -105,7 +124,6 @@ def callback():
         abort(400)
     return 'OK', 200
 
-# 定時檢查價格與推播降價
 @app.route("/check_prices", methods=['GET', 'POST'])
 def check_prices():
     conn = sqlite3.connect('tracker.db')
@@ -113,22 +131,17 @@ def check_prices():
     cursor.execute("SELECT user_id, item_id, brand, name_tw, name_jp, price_tw, price_jp FROM tracked_items_v2")
     rows = cursor.fetchall()
 
-    updated_count = 0
-    notifications = 0
+    updated_count, notifications = 0, 0
 
     for user_id, item_id, brand, old_name_tw, old_name_jp, old_p_tw, old_p_jp in rows:
         c_brand, c_name_tw, c_p_tw, c_name_jp, c_p_jp = get_combined_info(item_id)
-        
         if c_p_tw is not None or c_p_jp is not None:
             drops = []
-            # 檢查台灣是否降價
             if old_p_tw and c_p_tw and c_p_tw < old_p_tw:
                 drops.append(f"🇹🇼 台灣特價: NT$ {int(c_p_tw)} (原價 NT$ {int(old_p_tw)})")
-            # 檢查日本是否降價
             if old_p_jp and c_p_jp and c_p_jp < old_p_jp:
                 drops.append(f"🇯🇵 日本特價: ¥ {int(c_p_jp)} (原價 ¥ {int(old_p_jp)})")
 
-            # 若有任一地區降價，發送推播
             if drops:
                 display_name = c_name_tw if c_name_tw else c_name_jp
                 msg = (f"🎉【降價通知】🎉\n"
@@ -143,7 +156,6 @@ def check_prices():
                 except Exception as e:
                     print(f"Push failed: {e}")
 
-            # 更新最新價格與名稱
             cursor.execute('''
                 UPDATE tracked_items_v2 
                 SET name_tw = ?, name_jp = ?, price_tw = ?, price_jp = ? 
@@ -182,7 +194,6 @@ def handle_message(event):
             reply += "\n每天系統會自動檢查台日兩地的價格變動！"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    # 指令：+貨號
     elif user_msg.startswith("+"):
         item_id = user_msg[1:].strip()
         if item_id.isdigit():
@@ -208,7 +219,6 @@ def handle_message(event):
             reply = "💡 請使用正確格式：`+貨號`（例如 `+484808`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    # 指令：-貨號
     elif user_msg.startswith("-"):
         item_id = user_msg[1:].strip()
         if item_id.isdigit():
