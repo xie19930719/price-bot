@@ -1,6 +1,8 @@
 import os
+import json
 import sqlite3
-import requests
+import urllib.request
+import urllib.error
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -36,16 +38,16 @@ def init_db():
 
 init_db()
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-}
-
 # 動態抓取台日即時匯率
 def get_jpy_rate():
     try:
-        res = requests.get("https://rate.bot.com.tw/xrt/flats/003/day", timeout=3)
-        if res.status_code == 200:
-            lines = res.text.splitlines()
+        req = urllib.request.Request(
+            "https://rate.bot.com.tw/xrt/flats/003/day",
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=3) as response:
+            html = response.read().decode('utf-8')
+            lines = html.splitlines()
             for line in lines:
                 if "JPY" in line:
                     parts = line.split(',')
@@ -56,53 +58,60 @@ def get_jpy_rate():
         print(f"Fetch exchange rate error: {e}")
     return 0.22
 
-# 直接對接 uq.goodjack.tw 的產品 API
-def fetch_from_goodjack(item_id):
+# 直接請求 Uniqlo 官方 API 節點 (使用原生 urllib 避免 Cloudflare 封鎖)
+def fetch_uniqlo_official(item_id, region="tw"):
     formatted_id = item_id.zfill(6)
     
-    # 台灣與日本 Goodjack API 路線
-    url_tw = f"https://uq.goodjack.tw/api/v1/products/{formatted_id}"
-    url_jp = f"https://uq.goodjack.tw/api/v1/japan/products/{formatted_id}"
+    if region == "tw":
+        url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products?query={formatted_id}&limit=1"
+        lang = "zh-TW,zh;q=0.9"
+    else:
+        url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products?query={formatted_id}&limit=1"
+        lang = "ja-JP,ja;q=0.9"
 
-    name_tw, price_tw = None, None
-    name_jp, price_jp = None, None
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+        'Accept': 'application/json',
+        'Accept-Language': lang
+    })
 
-    # 1. 抓台灣 Goodjack
     try:
-        res_tw = requests.get(url_tw, headers=HEADERS, timeout=5)
-        if res_tw.status_code == 200:
-            data = res_tw.json()
-            name_tw = data.get('name') or data.get('title')
-            # 取得最新一筆價格紀錄
-            prices = data.get('prices', [])
-            if prices and len(prices) > 0:
-                price_tw = float(prices[0].get('price'))
-            elif 'price' in data:
-                price_tw = float(data['price'])
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                res_data = json.loads(response.read().decode('utf-8'))
+                items = res_data.get('result', {}).get('items', [])
+                if items:
+                    item = items[0]
+                    name = item.get('name') or item.get('productName')
+                    
+                    # 抓價格
+                    price_val = None
+                    prices = item.get('prices', {})
+                    if isinstance(prices, dict):
+                        for k in ['promo', 'base', 'original']:
+                            if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
+                                price_val = float(prices[k]['value'])
+                                break
+                    if price_val is None and 'minPrice' in item:
+                        price_val = float(item['minPrice'])
+                        
+                    return name, price_val
     except Exception as e:
-        print(f"Goodjack TW API Error: {e}")
+        print(f"Fetch error ({region}-{item_id}): {e}")
 
-    # 2. 抓日本 Goodjack
-    try:
-        res_jp = requests.get(url_jp, headers=HEADERS, timeout=5)
-        if res_jp.status_code == 200:
-            data = res_jp.json()
-            name_jp = data.get('name') or data.get('title')
-            prices = data.get('prices', [])
-            if prices and len(prices) > 0:
-                price_jp = float(prices[0].get('price'))
-            elif 'price' in data:
-                price_jp = float(data['price'])
-    except Exception as e:
-        print(f"Goodjack JP API Error: {e}")
+    return None, None
 
-    # 交叉補全品名
+# 整合台日兩地資料
+def get_combined_info(item_id):
+    name_tw, price_tw = fetch_uniqlo_official(item_id, "tw")
+    name_jp, price_jp = fetch_uniqlo_official(item_id, "jp")
+
     display_tw = name_tw if name_tw else name_jp
     display_jp = name_jp if name_jp else name_tw
 
     brand = None
     if price_tw is not None or price_jp is not None or display_tw is not None:
-        brand = "UNIQLO/GU"
+        brand = "UNIQLO"
 
     return brand, display_tw, price_tw, display_jp, price_jp
 
@@ -115,7 +124,7 @@ def format_jp_price(price_jp, rate):
 
 @app.route("/")
 def home():
-    return "H電商台日價格追蹤 Bot (Goodjack對接版) 運作中！", 200
+    return "H電商台日價格追蹤 Bot 運作中！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -138,7 +147,7 @@ def check_prices():
     rate = get_jpy_rate()
 
     for user_id, item_id, brand, old_name_tw, old_name_jp, old_p_tw, old_p_jp in rows:
-        c_brand, c_name_tw, c_p_tw, c_name_jp, c_p_jp = fetch_from_goodjack(item_id)
+        c_brand, c_name_tw, c_p_tw, c_name_jp, c_p_jp = get_combined_info(item_id)
         if c_p_tw is not None or c_p_jp is not None:
             drops = []
             if old_p_tw and c_p_tw and c_p_tw < old_p_tw:
@@ -153,8 +162,8 @@ def check_prices():
                        f"您追蹤的商品降價囉！\n\n"
                        f"📦 [{brand}] {display_name} ({item_id})\n" +
                        "\n".join(drops) + "\n\n"
-                       f"🔗 台灣歷史價格: https://uq.goodjack.tw/item/{item_id}\n"
-                       f"🔗 日本歷史價格: https://uq.goodjack.tw/japan/item/{item_id}")
+                       f"🔗 台灣官網: https://www.uniqlo.com/tw/zh_TW/product-detail.html?productCode={item_id}\n"
+                       f"🔗 日本官網: https://www.uniqlo.com/jp/ja/products/{item_id}")
                 try:
                     line_bot_api.push_message(user_id, TextSendMessage(text=msg))
                     notifications += 1
@@ -205,7 +214,7 @@ def handle_message(event):
     elif user_msg.startswith("+"):
         item_id = user_msg[1:].strip()
         if item_id.isdigit():
-            brand, n_tw, p_tw, n_jp, p_jp = fetch_from_goodjack(item_id)
+            brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
             if brand:
                 cursor.execute('''
                     INSERT OR REPLACE INTO tracked_items_v2 
@@ -239,7 +248,7 @@ def handle_message(event):
 
     elif user_msg.isdigit():
         item_id = user_msg
-        brand, n_tw, p_tw, n_jp, p_jp = fetch_from_goodjack(item_id)
+        brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
         if brand:
             reply = f"🔍 查價結果 (貨號：{item_id})\n\n"
             if n_tw: reply += f"🇹🇼 中文：{n_tw}\n"
