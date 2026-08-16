@@ -24,9 +24,12 @@ def fetch_product_details(url):
             
         soup = BeautifulSoup(html_content, "html.parser")
         
-        # 1. 抓取商品名稱
+        # 1. 抓取商品名稱，並將所有換行與多餘空白合併為乾淨的一行
         name_tag = soup.find("h1")
-        name = name_tag.text.strip() if name_tag else "未知商品"
+        if name_tag:
+            name = " ".join(name_tag.text.split())
+        else:
+            name = "未知商品"
         
         tw_price = "無資料"
         jp_price = "無資料"
