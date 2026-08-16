@@ -58,6 +58,7 @@ def get_jpy_rate():
         print(f"[ERROR] Fetch exchange rate failed: {e}")
     return 0.22
 
+# 深度剖析 Uniqlo JSON 結構的輔助函式
 def parse_uniqlo_json(res_data):
     result = res_data.get('result', {})
     if not result:
@@ -66,47 +67,55 @@ def parse_uniqlo_json(res_data):
     if 'items' in result and isinstance(result['items'], list) and len(result['items']) > 0:
         result = result['items'][0]
 
+    # 取出商品名稱
     name = result.get('name') or result.get('productName')
     price_val = None
 
+    # 多重價格結構解析
     if 'minPrice' in result and result['minPrice'] is not None:
         price_val = float(result['minPrice'])
     elif 'prices' in result and isinstance(result['prices'], dict):
         prices = result['prices']
-        for k in ['promo', 'base', 'original']:
+        for k in ['promo', 'base', 'original', 'sale']:
             if k in prices and isinstance(prices[k], dict) and prices[k].get('value') is not None:
                 price_val = float(prices[k]['value'])
+                break
+    elif 'l2Goods' in result and isinstance(result['l2Goods'], list) and len(result['l2Goods']) > 0:
+        # 從規格列表提取第一個有標價的商品
+        for g in result['l2Goods']:
+            if 'price' in g and g['price']:
+                price_val = float(g['price'])
                 break
 
     return name, price_val
 
 def fetch_uniqlo_official(item_id, region="tw"):
-    clean_id = item_id.strip()
+    clean_id = item_id.strip().zfill(6)
+    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
         'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8' if region == 'tw' else 'ja-JP,ja;q=0.9'
+        'Accept-Language': 'zh-TW,zh;q=0.9' if region == 'tw' else 'ja-JP,ja;q=0.9'
     }
 
-    # API 測試網址
+    # 多重 Endpoints 輪詢測試 (包含全碼 E{貨號}-000 與短碼)
     urls = [
+        f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/E{clean_id}-000?priceCode=L2",
         f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products/{clean_id}?priceCode=L2",
         f"https://www.uniqlo.com/{region}/api/commerce/v5/{region}/products?query={clean_id}&limit=1"
     ]
+
     for url in urls:
         try:
-            print(f"[DEBUG] Trying API URL: {url}")
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=4) as response:
-                print(f"[DEBUG] API Status: {response.status}")
                 if response.status == 200:
                     res_data = json.loads(response.read().decode('utf-8'))
                     name, price = parse_uniqlo_json(res_data)
-                    print(f"[DEBUG] Parsed Result -> Name: {name}, Price: {price}")
-                    if name or price:
+                    if name and price:
                         return name, price
         except Exception as e:
-            print(f"[ERROR] API Request failed ({region}-{item_id}): {e}")
+            print(f"[FETCH ERROR] {region}-{clean_id} via {url}: {e}")
 
     return None, None
 
@@ -133,7 +142,7 @@ def format_jp_price(price_jp, rate):
 def home():
     return "電商台日價格追蹤 Bot 運作中！", 200
 
-# 🛠️ 專屬測試 Endpoint (用網址直接測試)
+# 測試 Endpoint
 @app.route("/test/<item_id>")
 def test_item(item_id):
     brand, n_tw, p_tw, n_jp, p_jp = get_combined_info(item_id)
@@ -169,7 +178,7 @@ def handle_message(event):
         cursor.execute("SELECT item_id, brand, name_tw, name_jp, price_tw, price_jp FROM tracked_items_v2 WHERE user_id = ?", (user_id,))
         items = cursor.fetchall()
         if not items:
-            reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+465185`）即可開始追蹤！"
+            reply = "📋 目前沒有追蹤任何商品。\n輸入 `+貨號`（例如 `+475355`）即可開始追蹤！"
         else:
             reply = "📋 您目前追蹤的商品清單：\n"
             for item_id, brand, n_tw, n_jp, p_tw, p_jp in items:
@@ -208,7 +217,7 @@ def handle_message(event):
             else:
                 reply = f"❌ 找不到貨號 `{item_id}` 的商品，請確認貨號是否正確。"
         else:
-            reply = "💡 請使用正確格式：`+貨號`（例如 `+465185`）"
+            reply = "💡 請使用正確格式：`+貨號`（例如 `+475355`）"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     elif user_msg.isdigit():
@@ -227,7 +236,7 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     else:
-        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `465185`）：快速查價\n• 輸入 `+貨號`（如 `+465185`）：加入降價追蹤\n• 輸入 `-貨號`：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
+        reply = "🤖 可用指令：\n• 直接輸入 `貨號`（如 `475355`）：快速查價\n• 輸入 `+貨號`（如 `+475355`）：加入降價追蹤\n• 輸入 `-貨號`：取消追蹤\n• 輸入 `清單`：查看所有追蹤商品"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     conn.close()
