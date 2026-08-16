@@ -37,19 +37,27 @@ def init_db():
 
 init_db()
 
-# 單一 API 查詢工具
-def fetch_api(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+# 通用 API 請求函式（帶上完整的瀏覽器 Headers 避免被 API 反爬蟲擋掉）
+def fetch_api(url, referer_url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': referer_url
+    }
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        data = res.json()
-        if data.get('code') == '200':
-            result = data['result']
-            name = result['items'][0]['name']
-            price = float(result['items'][0]['prices']['base']['value'])
-            return name, price
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('code') == '200' and 'result' in data:
+                items = data['result'].get('items', [])
+                if items:
+                    name = items[0].get('name')
+                    price_val = items[0].get('prices', {}).get('base', {}).get('value')
+                    if price_val is not None:
+                        return name, float(price_val)
     except Exception as e:
-        pass
+        print(f"Fetch API error for {url}: {e}")
     return None, None
 
 # 整合查詢：同時搜尋 Uniqlo / GU 的台灣與日本資料
@@ -58,22 +66,25 @@ def get_combined_info(item_id):
     name_tw, price_tw = None, None
     name_jp, price_jp = None, None
 
-    # 1. 先查 Uniqlo
-    tw_u_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{item_id}?priceGroup=official"
-    jp_u_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{item_id}?priceGroup=official"
+    # 格式化貨號 (確保 6 位數字)
+    formatted_id = item_id.zfill(6)
+
+    # 1. 搜尋 Uniqlo (台灣 & 日本)
+    tw_u_url = f"https://www.uniqlo.com/tw/api/commerce/v5/tw/products/{formatted_id}?priceGroup=official"
+    jp_u_url = f"https://www.uniqlo.com/jp/api/commerce/v5/jp/products/{formatted_id}?priceGroup=official"
     
-    name_tw, price_tw = fetch_api(tw_u_url)
-    name_jp, price_jp = fetch_api(jp_u_url)
+    name_tw, price_tw = fetch_api(tw_u_url, "https://www.uniqlo.com/tw/")
+    name_jp, price_jp = fetch_api(jp_u_url, "https://www.uniqlo.com/jp/")
 
     if price_tw is not None or price_jp is not None:
         brand = "UNIQLO"
     else:
-        # 2. 如果 Uniqlo 都沒查到，查 GU
-        tw_g_url = f"https://www.gu-global.com/tw/api/commerce/v5/tw/products/{item_id}?priceGroup=official"
-        jp_g_url = f"https://www.gu-global.com/jp/api/commerce/v5/jp/products/{item_id}?priceGroup=official"
+        # 2. 若 Uniqlo 沒找到，搜尋 GU (台灣 & 日本)
+        tw_g_url = f"https://www.gu-global.com/tw/api/commerce/v5/tw/products/{formatted_id}?priceGroup=official"
+        jp_g_url = f"https://www.gu-global.com/jp/api/commerce/v5/jp/products/{formatted_id}?priceGroup=official"
         
-        name_tw, price_tw = fetch_api(tw_g_url)
-        name_jp, price_jp = fetch_api(jp_g_url)
+        name_tw, price_tw = fetch_api(tw_g_url, "https://www.gu-global.com/tw/")
+        name_jp, price_jp = fetch_api(jp_g_url, "https://www.gu-global.com/jp/")
         
         if price_tw is not None or price_jp is not None:
             brand = "GU"
