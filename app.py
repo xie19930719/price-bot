@@ -26,14 +26,24 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # 商品清單資料表 (新增 jp_url 欄位)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tracked_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
             url TEXT,
+            jp_url TEXT,
             name TEXT,
             tw_price TEXT,
             jp_price TEXT
+        )
+    """)
+    # 使用者操作狀態資料表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id TEXT PRIMARY KEY,
+            action TEXT,
+            target_item_id INTEGER
         )
     """)
     conn.commit()
@@ -50,13 +60,13 @@ def get_jpy_to_twd_rate():
             for line in lines:
                 if "JPY" in line:
                     parts = line.split(",")
-                    rate = float(parts[12])
-                    return rate
+                    return float(parts[12])
     except Exception:
         pass
     return 0.21
 
 def fetch_product_details(url):
+    """抓取 Goodjack 台灣/日本混合頁面"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -64,12 +74,10 @@ def fetch_product_details(url):
             html_content = response.read().decode("utf-8", errors="ignore")
             
         soup = BeautifulSoup(html_content, "html.parser")
-        
         name_tag = soup.find("h1")
         name = " ".join(name_tag.text.split()) if name_tag else "未知商品"
         
-        tw_price = "無資料"
-        jp_price = "無資料"
+        tw_price, jp_price = "無資料", "無資料"
         text = soup.get_text()
         
         tw_match = re.search(r"NT\$\s*([\d,]+)", text)
@@ -93,6 +101,25 @@ def fetch_product_details(url):
         print(f"Error fetching product: {e}")
         return None, None, None
 
+def fetch_jp_official_price(jp_url):
+    """抓取日本 Uniqlo 官網 (uniqlo.com/jp) 的價格"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        req = urllib.request.Request(jp_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html_content = response.read().decode("utf-8", errors="ignore")
+            
+        soup = BeautifulSoup(html_content, "html.parser")
+        text = soup.get_text()
+        
+        # 匹配日幣價格
+        jp_match = re.search(r"[￥¥]\s*([\d,]+)", text)
+        if jp_match:
+            return jp_match.group(1)
+    except Exception as e:
+        print(f"Error fetching JP official price: {e}")
+    return None
+
 def format_jp_price_with_twd(jp_price_str):
     try:
         clean_val = float(jp_price_str.replace(",", ""))
@@ -106,13 +133,19 @@ def check_and_update_prices():
     print("⏳ 開始執行每日自動價格檢查...")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, user_id, url, name, tw_price, jp_price FROM tracked_items")
+    cursor.execute("SELECT id, user_id, url, jp_url, name, tw_price, jp_price FROM tracked_items")
     rows = cursor.fetchall()
     
     for row in rows:
-        item_id, user_id, url, old_name, old_tw, old_jp = row
+        item_id, user_id, url, jp_url, old_name, old_tw, old_jp = row
         new_name, new_tw, new_jp = fetch_product_details(url)
         
+        # 如果有綁定日本官網，優先從日本官網更新日幣價格
+        if jp_url:
+            official_jp = fetch_jp_official_price(jp_url)
+            if official_jp:
+                new_jp = official_jp
+
         if new_name and new_tw != "無資料":
             changes = []
             if new_tw != old_tw:
@@ -132,10 +165,9 @@ def check_and_update_prices():
                 try:
                     line_bot_api.push_message(user_id, TextSendMessage(text=push_msg))
                 except Exception as e:
-                    print(f"Push message error: {e}")
+                    print(f"Push error: {e}")
                     
     conn.close()
-    print("✅ 每日價格檢查完畢。")
 
 scheduler = BackgroundScheduler(timezone=TAIWAN_TZ)
 scheduler.add_job(func=check_and_update_prices, trigger="cron", hour=12, minute=0)
@@ -143,7 +175,7 @@ scheduler.start()
 
 @app.route("/")
 def home():
-    return "UQ 價格追蹤 Bot 與定時排程運作中！", 200
+    return "UQ 價格追蹤 Bot 運作中！", 200
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -160,46 +192,94 @@ def handle_message(event):
     msg = event.message.text.strip()
     user_id = event.source.user_id if hasattr(event.source, "user_id") else "default_user"
     
-    if msg == "清單":
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, tw_price, jp_price, url FROM tracked_items WHERE user_id = ?", (user_id,))
-        rows = cursor.fetchall()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 檢查使用者是否處於「等待輸入日本網址」的狀態
+    cursor.execute("SELECT action, target_item_id FROM user_states WHERE user_id = ?", (user_id,))
+    state = cursor.fetchone()
+    
+    if state and state[0] == "WAITING_JP_URL" and ("uniqlo.com" in msg or "goodjack.tw" in msg):
+        target_db_id = state[1]
+        jp_price = fetch_jp_official_price(msg) if "uniqlo.com" in msg else fetch_product_details(msg)[2]
+        
+        if jp_price:
+            cursor.execute(
+                "UPDATE tracked_items SET jp_url = ?, jp_price = ? WHERE id = ?",
+                (msg, jp_price, target_db_id)
+            )
+            cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+            conn.commit()
+            
+            jp_formatted = format_jp_price_with_twd(jp_price)
+            reply = f"✅ 已成功綁定日本網址！\n最新日本價格為：{jp_formatted}\n\n請輸入「清單」查看最新狀態。"
+        else:
+            reply = "⚠️ 無法抓取該日本網址的價格，請重新確認網址。"
+            
         conn.close()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # 清除舊的等待狀態 (如果發送了其他指令)
+    if state:
+        cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+    if msg == "清單":
+        cursor.execute("SELECT id, name, tw_price, jp_price, url, jp_url FROM tracked_items WHERE user_id = ?", (user_id,))
+        rows = cursor.fetchall()
         
         if not rows:
             reply = "📋 目前沒有追蹤任何商品。"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         else:
-            reply = "📋 【你的追蹤清單】\n點擊下方按鈕可直接刪除對應商品：\n"
-            for idx, row in enumerate(rows, 1):
-                item_id, name, tw_p, jp_p, url = row
-                jp_formatted = format_jp_price_with_twd(jp_p)
-                reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}\n   🔗 {url}\n"
-            
-            # 動態產生刪除按鈕 (Quick Reply)
+            reply = "📋 【你的追蹤清單】\n點擊下方按鈕可進行管理：\n"
             quick_reply_buttons = []
-            for idx in range(1, len(rows) + 1):
-                quick_reply_buttons.append(
-                    QuickReplyButton(
-                        action=MessageAction(label=f"刪除第 {idx} 項", text=f"-{idx}")
-                    )
-                )
-            # 另外加上一個「查看清單」或其它快捷按鈕
-            quick_reply_buttons.append(
-                QuickReplyButton(action=MessageAction(label="📋 重新整理清單", text="清單"))
-            )
             
-            quick_reply = QuickReply(items=quick_reply_buttons)
+            for idx, row in enumerate(rows, 1):
+                item_id, name, tw_p, jp_p, url, jp_url = row
+                jp_formatted = format_jp_price_with_twd(jp_p)
+                jp_note = " (已綁定日本官網)" if jp_url else ""
+                reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}{jp_note}\n   🔗 {url}\n"
+                
+                # 刪除與綁定按鈕
+                quick_reply_buttons.append(
+                    QuickReplyButton(action=MessageAction(label=f"🗑️ 刪除 {idx}", text=f"-{idx}"))
+                )
+                quick_reply_buttons.append(
+                    QuickReplyButton(action=MessageAction(label=f"🇯🇵 綁定日幣 {idx}", text=f"綁定日幣-{idx}"))
+                )
+            
+            quick_reply = QuickReply(items=quick_reply_buttons[:13]) # LINE 限制上限 13 個按鈕
             line_bot_api.reply_message(
                 event.reply_token, 
                 TextSendMessage(text=reply, quick_reply=quick_reply)
             )
-                
+
+    elif re.match(r"^綁定日幣-\d+$", msg):
+        target_idx = int(msg.replace("綁定日幣-", ""))
+        cursor.execute("SELECT id, name FROM tracked_items WHERE user_id = ?", (user_id,))
+        rows = cursor.fetchall()
+        
+        if 1 <= target_idx <= len(rows):
+            target_db_id = rows[target_idx - 1][0]
+            target_name = rows[target_idx - 1][1]
+            
+            # 設定使用者狀態為等待輸入網址
+            cursor.execute(
+                "INSERT OR REPLACE INTO user_states (user_id, action, target_item_id) VALUES (?, ?, ?)",
+                (user_id, "WAITING_JP_URL", target_db_id)
+            )
+            conn.commit()
+            
+            reply = f"💡 請直接傳送「{target_name}」在日本官網（uniqlo.com/jp）的商品網址，將自動為您綁定價格！"
+        else:
+            reply = "⚠️ 找不到該編號的商品。"
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
     elif re.match(r"^-\d+$", msg):
         target_idx = int(msg.replace("-", ""))
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
         cursor.execute("SELECT id FROM tracked_items WHERE user_id = ?", (user_id,))
         rows = cursor.fetchall()
         
@@ -207,18 +287,21 @@ def handle_message(event):
             real_db_id = rows[target_idx - 1][0]
             cursor.execute("DELETE FROM tracked_items WHERE id = ?", (real_db_id,))
             conn.commit()
-            reply = f"🗑️ 已成功刪除清單中的第 {target_idx} 項商品。\n請輸入「清單」查看最新狀態。"
+            reply = f"🗑️ 已成功刪除第 {target_idx} 項商品。"
         else:
             reply = "⚠️ 找不到該編號的商品。"
-        conn.close()
-        
+            
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        
-    elif "goodjack.tw" in msg:
-        name, tw_p, jp_p = fetch_product_details(msg)
+
+    elif "goodjack.tw" in msg or "uniqlo.com" in msg:
+        # 新增商品
+        if "uniqlo.com" in msg:
+            jp_p = fetch_jp_official_price(msg)
+            name, tw_p = "日本 Uniqlo 商品", "無資料"
+        else:
+            name, tw_p, jp_p = fetch_product_details(msg)
+            
         if name:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
             cursor.execute("SELECT id FROM tracked_items WHERE user_id = ? AND url = ?", (user_id, msg))
             existing = cursor.fetchone()
             
@@ -227,39 +310,29 @@ def handle_message(event):
                     "INSERT INTO tracked_items (user_id, url, name, tw_price, jp_price) VALUES (?, ?, ?, ?, ?)",
                     (user_id, msg, name, tw_p, jp_p)
                 )
-                conn.commit()
                 status_msg = "✅ 已成功加入追蹤清單！"
             else:
                 cursor.execute(
                     "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE user_id = ? AND url = ?",
                     (name, tw_p, jp_p, user_id, msg)
                 )
-                conn.commit()
-                status_msg = "ℹ️ 此商品已在清單中，已為您更新最新價格！"
-            conn.close()
+                status_msg = "ℹ️ 已為您更新最新價格！"
+            conn.commit()
             
             jp_formatted = format_jp_price_with_twd(jp_p)
             reply = f"{status_msg}\n\n📦 商品名稱：{name}\n🇹🇼 台灣售價：NT$ {tw_p}\n🇯🇵 日本售價：{jp_formatted}"
         else:
-            reply = "⚠️ 無法抓取該網址資料，請檢查網址是否正確。"
+            reply = "⚠️ 無法抓取該網址資料，請檢查網址。"
             
-        # 附上快捷按鈕讓使用者可以快速查看清單
         quick_reply = QuickReply(items=[
             QuickReplyButton(action=MessageAction(label="📋 查看清單", text="清單"))
         ])
-        line_bot_api.reply_message(
-            event.reply_token, 
-            TextSendMessage(text=reply, quick_reply=quick_reply)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply, quick_reply=quick_reply))
     else:
         reply = "💡 請傳送 UQ 網址加入追蹤，或輸入「清單」查看全部。"
-        quick_reply = QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="📋 查看清單", text="清單"))
-        ])
-        line_bot_api.reply_message(
-            event.reply_token, 
-            TextSendMessage(text=reply, quick_reply=quick_reply)
-        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        
+    conn.close()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
