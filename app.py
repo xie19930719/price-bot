@@ -103,12 +103,15 @@ def fetch_product_details(url):
         return None, None, None
 
 def fetch_jp_official_price(jp_url):
-    """透過日本 Uniqlo 官方 API 抓取精確日幣價格"""
+    """透過日本 Uniqlo 官方 API 抓取精確日幣價格 (含完整 Header 防擋)"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.uniqlo.com/jp/ja/",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     }
     try:
-        # 強化的正則表達式：精確匹配網址中的 6 位數商品編號 (如 475344)
+        # 從網址精確摳出 6 位數商品編號
         productId_match = re.search(r"(\d{6})", jp_url)
         if not productId_match:
             return None
@@ -124,8 +127,7 @@ def fetch_jp_official_price(jp_url):
             promo_price = prices.get("promo", {}).get("base", {}).get("value")
             base_price = prices.get("base", {}).get("value")
             
-            # 優先採用限定特價 (promo)，若無則採用原價 (base)
-            final_price = promo_price if promo_price else base_price
+            final_price = promo_price if promo_price is not None else base_price
             
             if final_price is not None:
                 return f"{int(final_price):,}"
@@ -216,7 +218,6 @@ def handle_message(event):
     if state and state[0] == "WAITING_JP_URL" and ("uniqlo.com" in msg or "goodjack.tw" in msg):
         target_db_id = state[1]
         
-        # 判斷是日本官網網址還是 Goodjack 網址
         if "uniqlo.com" in msg:
             jp_price = fetch_jp_official_price(msg)
         else:
@@ -227,21 +228,18 @@ def handle_message(event):
                 "UPDATE tracked_items SET jp_url = ?, jp_price = ? WHERE id = ?",
                 (msg, jp_price, target_db_id)
             )
-            # 只有在「成功抓取並綁定」時才刪除等待狀態
             cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.commit()
             
             jp_formatted = format_jp_price_with_twd(jp_price)
             reply = f"✅ 已成功綁定日本網址！\n最新日本價格為：{jp_formatted}\n\n請輸入「清單」查看最新狀態。"
         else:
-            # 失敗時保留狀態，方便使用者補傳短網址
-            reply = "⚠️ 無法抓取該日本網址的價格，請重新確認網址是否正確，或直接傳送含有 6 位數編號的網址。"
+            reply = "⚠️ 無法抓取該日本網址的價格，請重新確認網址是否正確。"
             
         conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    # 若傳送其他普通指令，清除等待狀態
     if state and not re.match(r"^綁定日幣-\d+$", msg):
         cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
         conn.commit()
@@ -263,7 +261,6 @@ def handle_message(event):
                 jp_note = " (已綁定日本官網)" if jp_url else ""
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}{jp_note}\n   🔗 {url}\n"
                 
-                # 快捷按鈕：刪除與綁定
                 quick_reply_buttons.append(
                     QuickReplyButton(action=MessageAction(label=f"🗑️ 刪除 {idx}", text=f"-{idx}"))
                 )
@@ -271,7 +268,7 @@ def handle_message(event):
                     QuickReplyButton(action=MessageAction(label=f"🇯🇵 綁定日幣 {idx}", text=f"綁定日幣-{idx}"))
                 )
             
-            quick_reply = QuickReply(items=quick_reply_buttons[:13]) # LINE QuickReply 限制最多 13 個按鈕
+            quick_reply = QuickReply(items=quick_reply_buttons[:13])
             line_bot_api.reply_message(
                 event.reply_token, 
                 TextSendMessage(text=reply, quick_reply=quick_reply)
