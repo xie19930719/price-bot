@@ -108,8 +108,8 @@ def fetch_jp_official_price(jp_url):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        # 從網址擷取 6 位數商品編號 (例如從 .../E475344-000/... 擷取出 475344)
-        productId_match = re.search(r"E?(\d{6})", jp_url)
+        # 強化的正則表達式：精確匹配網址中的 6 位數商品編號 (如 475344)
+        productId_match = re.search(r"(\d{6})", jp_url)
         if not productId_match:
             return None
         
@@ -227,20 +227,22 @@ def handle_message(event):
                 "UPDATE tracked_items SET jp_url = ?, jp_price = ? WHERE id = ?",
                 (msg, jp_price, target_db_id)
             )
+            # 只有在「成功抓取並綁定」時才刪除等待狀態
             cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.commit()
             
             jp_formatted = format_jp_price_with_twd(jp_price)
             reply = f"✅ 已成功綁定日本網址！\n最新日本價格為：{jp_formatted}\n\n請輸入「清單」查看最新狀態。"
         else:
-            reply = "⚠️ 無法抓取該日本網址的價格，請重新確認網址是否包含 6 位數商品編號。"
+            # 失敗時保留狀態，方便使用者補傳短網址
+            reply = "⚠️ 無法抓取該日本網址的價格，請重新確認網址是否正確，或直接傳送含有 6 位數編號的網址。"
             
         conn.close()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    # 若發送其他訊息，清除狀態
-    if state:
+    # 若傳送其他普通指令，清除等待狀態
+    if state and not re.match(r"^綁定日幣-\d+$", msg):
         cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
         conn.commit()
 
@@ -261,7 +263,7 @@ def handle_message(event):
                 jp_note = " (已綁定日本官網)" if jp_url else ""
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}{jp_note}\n   🔗 {url}\n"
                 
-                # 刪除與綁定快捷按鈕
+                # 快捷按鈕：刪除與綁定
                 quick_reply_buttons.append(
                     QuickReplyButton(action=MessageAction(label=f"🗑️ 刪除 {idx}", text=f"-{idx}"))
                 )
@@ -269,7 +271,7 @@ def handle_message(event):
                     QuickReplyButton(action=MessageAction(label=f"🇯🇵 綁定日幣 {idx}", text=f"綁定日幣-{idx}"))
                 )
             
-            quick_reply = QuickReply(items=quick_reply_buttons[:13]) # LINE QuickReply 限制最多 13 個選項
+            quick_reply = QuickReply(items=quick_reply_buttons[:13]) # LINE QuickReply 限制最多 13 個按鈕
             line_bot_api.reply_message(
                 event.reply_token, 
                 TextSendMessage(text=reply, quick_reply=quick_reply)
