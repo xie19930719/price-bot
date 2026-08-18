@@ -1,7 +1,8 @@
 import os
 import re
-import sqlite3
 import urllib.request
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
@@ -17,19 +18,31 @@ app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "551273045ea1be5721345edf4196aec7")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU=")
-DB_PATH = "tracker.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# 自動修正 postgres:// 為 postgresql://
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 TAIWAN_TZ = timezone(timedelta(hours=8))
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+def get_db_connection():
+    """取得 PostgreSQL 資料庫連線"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL 環境變數未設定！")
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    """初始化雲端資料庫資料表"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    # 商品清單資料表
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tracked_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id TEXT,
             url TEXT,
             jp_url TEXT,
@@ -39,6 +52,7 @@ def init_db():
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
@@ -58,7 +72,7 @@ def get_jpy_to_twd_rate():
     return 0.21
 
 def fetch_product_details(url):
-    """抓取 Goodjack 頁面資料 (包含名稱、台灣價格、日本價格)"""
+    """抓取 Goodjack 頁面資料"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -104,13 +118,19 @@ def format_jp_price_with_twd(jp_price_str):
 
 def check_and_update_prices():
     print("⏳ 開始執行每日自動價格檢查...")
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT id, user_id, url, name, tw_price, jp_price FROM tracked_items")
     rows = cursor.fetchall()
     
     for row in rows:
-        item_id, user_id, url, old_name, old_tw, old_jp = row
+        item_id = row['id']
+        user_id = row['user_id']
+        url = row['url']
+        old_name = row['name']
+        old_tw = row['tw_price']
+        old_jp = row['jp_price']
+
         new_name, new_tw, new_jp = fetch_product_details(url)
 
         if new_name and new_tw != "無資料":
@@ -122,7 +142,7 @@ def check_and_update_prices():
             
             if changes:
                 cursor.execute(
-                    "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE id = ?",
+                    "UPDATE tracked_items SET name = %s, tw_price = %s, jp_price = %s WHERE id = %s",
                     (new_name, new_tw, new_jp, item_id)
                 )
                 conn.commit()
@@ -134,6 +154,7 @@ def check_and_update_prices():
                 except Exception as e:
                     print(f"Push error: {e}")
                     
+    cursor.close()
     conn.close()
     print("✅ 每日價格檢查完畢。")
 
@@ -160,11 +181,11 @@ def handle_message(event):
     msg = event.message.text.strip()
     user_id = event.source.user_id if hasattr(event.source, "user_id") else "default_user"
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
 
     if msg == "清單":
-        cursor.execute("SELECT id, name, tw_price, jp_price, url FROM tracked_items WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT id, name, tw_price, jp_price, url FROM tracked_items WHERE user_id = %s ORDER BY id ASC", (user_id,))
         rows = cursor.fetchall()
         
         if not rows:
@@ -175,11 +196,14 @@ def handle_message(event):
             quick_reply_buttons = []
             
             for idx, row in enumerate(rows, 1):
-                item_id, name, tw_p, jp_p, url = row
+                name = row['name']
+                tw_p = row['tw_price']
+                jp_p = row['jp_price']
+                url = row['url']
+
                 jp_formatted = format_jp_price_with_twd(jp_p)
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}\n   🔗 {url}\n"
                 
-                # 快捷按鈕：僅留刪除選項
                 quick_reply_buttons.append(
                     QuickReplyButton(action=MessageAction(label=f"🗑️ 刪除 {idx}", text=f"-{idx}"))
                 )
@@ -192,12 +216,12 @@ def handle_message(event):
 
     elif re.match(r"^-\d+$", msg):
         target_idx = int(msg.replace("-", ""))
-        cursor.execute("SELECT id FROM tracked_items WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT id FROM tracked_items WHERE user_id = %s ORDER BY id ASC", (user_id,))
         rows = cursor.fetchall()
         
         if 1 <= target_idx <= len(rows):
-            real_db_id = rows[target_idx - 1][0]
-            cursor.execute("DELETE FROM tracked_items WHERE id = ?", (real_db_id,))
+            real_db_id = rows[target_idx - 1]['id']
+            cursor.execute("DELETE FROM tracked_items WHERE id = %s", (real_db_id,))
             conn.commit()
             reply = f"🗑️ 已成功刪除第 {target_idx} 項商品。"
         else:
@@ -209,18 +233,18 @@ def handle_message(event):
         name, tw_p, jp_p = fetch_product_details(msg)
             
         if name and tw_p != "無資料":
-            cursor.execute("SELECT id FROM tracked_items WHERE user_id = ? AND url = ?", (user_id, msg))
+            cursor.execute("SELECT id FROM tracked_items WHERE user_id = %s AND url = %s", (user_id, msg))
             existing = cursor.fetchone()
             
             if not existing:
                 cursor.execute(
-                    "INSERT INTO tracked_items (user_id, url, name, tw_price, jp_price) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO tracked_items (user_id, url, name, tw_price, jp_price) VALUES (%s, %s, %s, %s, %s)",
                     (user_id, msg, name, tw_p, jp_p)
                 )
                 status_msg = "✅ 已成功加入追蹤清單！"
             else:
                 cursor.execute(
-                    "UPDATE tracked_items SET name = ?, tw_price = ?, jp_price = ? WHERE user_id = ? AND url = ?",
+                    "UPDATE tracked_items SET name = %s, tw_price = %s, jp_price = %s WHERE user_id = %s AND url = %s",
                     (name, tw_p, jp_p, user_id, msg)
                 )
                 status_msg = "ℹ️ 已為您更新最新價格！"
@@ -239,6 +263,7 @@ def handle_message(event):
         reply = "💡 請傳送 UQ (Goodjack) 網址加入追蹤，或輸入「清單」查看全部。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         
+    cursor.close()
     conn.close()
 
 if __name__ == "__main__":
