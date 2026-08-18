@@ -2,4 +2,4 @@ flask
 line-bot-sdk
 beautifulsoup4
 apscheduler
-gunicorn
+psycopg2-binary
