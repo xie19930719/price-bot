@@ -32,28 +32,38 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 def get_db_connection():
     """取得 PostgreSQL 資料庫連線"""
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL 環境變數未設定！")
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+        print("❌ 錯誤：DATABASE_URL 未設定！")
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        return conn
+    except Exception as e:
+        print(f"❌ 資料庫連線失敗：{e}")
+        return None
 
 def init_db():
     """初始化雲端資料庫資料表"""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_items (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            url TEXT,
-            jp_url TEXT,
-            name TEXT,
-            tw_price TEXT,
-            jp_price TEXT
-        )
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tracked_items (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT,
+                    url TEXT,
+                    jp_url TEXT,
+                    name TEXT,
+                    tw_price TEXT,
+                    jp_price TEXT
+                )
+            """)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("✅ 雲端資料庫 Table 初始化成功！")
+        except Exception as e:
+            print(f"❌ 資料表創建失敗：{e}")
 
 init_db()
 
@@ -119,6 +129,9 @@ def format_jp_price_with_twd(jp_price_str):
 def check_and_update_prices():
     print("⏳ 開始執行每日自動價格檢查...")
     conn = get_db_connection()
+    if not conn:
+        return
+    
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT id, user_id, url, name, tw_price, jp_price FROM tracked_items")
     rows = cursor.fetchall()
@@ -182,6 +195,10 @@ def handle_message(event):
     user_id = event.source.user_id if hasattr(event.source, "user_id") else "default_user"
     
     conn = get_db_connection()
+    if not conn:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 資料庫連線異常，請稍後再試！"))
+        return
+
     cursor = conn.cursor(cursor_factory=RealDictCursor)
 
     if msg == "清單":
