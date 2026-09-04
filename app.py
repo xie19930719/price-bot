@@ -92,7 +92,7 @@ def fetch_product_details(url):
         
         tw_price, jp_price = "無資料", "無資料"
         
-        # 尋找頁面中的大字體當前售價元素
+        # 尋找頁面中的當前售價元素
         price_candidates = []
         for text_node in soup.find_all(text=re.compile(r"\$\s*\d+")):
             m = re.search(r"\$\s*([\d,]+)", text_node)
@@ -221,10 +221,23 @@ def handle_message(event):
             quick_reply_buttons = []
             
             for idx, row in enumerate(rows, 1):
-                name = row['name']
-                tw_p = row['tw_price']
-                jp_p = row['jp_price']
+                item_id = row['id']
                 url = row['url']
+                old_tw_p = row['tw_price']
+                old_jp_p = row['jp_price']
+
+                # 即時重新擷取最新價格並更新資料庫
+                new_name, new_tw, new_jp = fetch_product_details(url)
+                name = new_name if new_name else row['name']
+                tw_p = new_tw if new_tw != "無資料" else old_tw_p
+                jp_p = new_jp if new_jp != "無資料" else old_jp_p
+
+                if new_tw != "無資料" and (tw_p != old_tw_p or jp_p != old_jp_p):
+                    cursor.execute(
+                        "UPDATE tracked_items SET name = %s, tw_price = %s, jp_price = %s WHERE id = %s",
+                        (name, tw_p, jp_p, item_id)
+                    )
+                    conn.commit()
 
                 jp_formatted = format_jp_price_with_twd(jp_p)
                 reply += f"\n{idx}. {name}\n   🇹🇼 NT$ {tw_p} | 🇯🇵 {jp_formatted}\n   🔗 {url}\n"
