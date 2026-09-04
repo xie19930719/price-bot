@@ -20,7 +20,6 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "551273045ea1be5721345edf
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "ftDqy1HYMrkLC/YX5uSh+9Pcq8Sk8bRcpn7vLbquj96GqzdJNhpxuybYD5DaCGtThb4fot7pctmHHgkAfpOzyqbN5vT/y5wSRcQpHtOZ6j5+k7bwhvZTXqVubSaiSFdJlVw3yZXQJlE/hU3N4p9gpQdB04t89/1O/w1cDnyilFU=")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# 自動修正 postgres:// 為 postgresql://
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -30,7 +29,6 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 def get_db_connection():
-    """取得 PostgreSQL 資料庫連線"""
     if not DATABASE_URL:
         print("❌ 錯誤：DATABASE_URL 未設定！")
         return None
@@ -42,7 +40,6 @@ def get_db_connection():
         return None
 
 def init_db():
-    """初始化雲端資料庫資料表"""
     conn = get_db_connection()
     if conn:
         try:
@@ -82,7 +79,7 @@ def get_jpy_to_twd_rate():
     return 0.21
 
 def fetch_product_details(url):
-    """抓取 Goodjack 頁面資料"""
+    """抓取 Goodjack 頁面資料 (精確抓取當前特價)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -94,12 +91,23 @@ def fetch_product_details(url):
         name = " ".join(name_tag.text.split()) if name_tag else "未知商品"
         
         tw_price, jp_price = "無資料", "無資料"
-        text = soup.get_text()
         
-        tw_match = re.search(r"NT\$\s*([\d,]+)", text)
-        if tw_match:
-            tw_price = tw_match.group(1)
+        # 尋找頁面中的大字體當前售價元素
+        price_candidates = []
+        for text_node in soup.find_all(text=re.compile(r"\$\s*\d+")):
+            m = re.search(r"\$\s*([\d,]+)", text_node)
+            if m:
+                price_candidates.append(m.group(1))
+        
+        if price_candidates:
+            tw_price = price_candidates[0]
             
+        if tw_price == "無資料":
+            tw_matches = re.findall(r"NT\$\s*([\d,]+)|\$\s*([\d,]+)", soup.get_text())
+            if tw_matches:
+                last_match = tw_matches[-1]
+                tw_price = last_match[0] or last_match[1]
+
         current_price_box = soup.find(string=re.compile(r"當前價格"))
         if current_price_box:
             parent_text = current_price_box.find_parent().get_text()
@@ -108,7 +116,7 @@ def fetch_product_details(url):
                 jp_price = jp_match.group(1)
         
         if jp_price == "無資料":
-            jp_match_all = re.search(r"[￥¥]\s*([\d,]+)", text)
+            jp_match_all = re.search(r"[￥¥]\s*([\d,]+)", soup.get_text())
             if jp_match_all:
                 jp_price = jp_match_all.group(1)
             
